@@ -1,0 +1,23 @@
+{
+  "_README": "This file contains human-verified trading rules. It is NEVER modified by the bot. Edit manually to add, change or remove rules. These take precedence over ai_lessons.json in the prompt.",
+
+  "compression_no_entry": "COMPRESSION regime means an ATR squeeze — breakout direction is unknown before the expansion candle. No entry is valid in COMPRESSION regardless of Gemini's signal. Wait for the expansion candle to define direction.",
+
+  "reversal_size_cap": "REVERSAL regime trades carry inherent gap and spike risk. Maximum position size is 50% of calculated lot, always. This is non-negotiable. The regime router enforces this but it is also a hard human rule.",
+
+  "consecutive_loss_halt": "After 3 consecutive losses halt new entries until the next trading session. The risk manager enforces this. Do not override it with any reasoning.",
+
+  "news_window_block": "No new entries 0-60 minutes before a high-impact news event. News gates are in data_extractor.py. This rule exists because slippage and spread widen unpredictably near events.",
+
+  "trend_direction_discipline": "In BULL_TREND take BUY setups only unless counter-trend evidence is overwhelming and stated explicitly. In BEAR_TREND take SELL setups only. Counter-trend trades in strong regimes fail at institutional order flow.",
+
+  "sl_beyond_structure": "Stop loss must always be placed beyond the last significant price structure, not behind the entry candle wick. SL behind a wick gets hunted before the trade has room to breathe.",
+
+  "dead_zone_no_entry": "No entries during dead zone sessions: 00:00-02:00, 05:00-07:00, 12:00-19:00 NY time. These windows have insufficient institutional participation for reliable order flow.",
+
+  "min_rr_by_strategy": "Minimum risk-to-reward ratios by strategy type: TREND >= 2.5R, RANGE >= 1.5R, SWEEP >= 1.2R. Do not take trades below these minimums regardless of confidence.",
+
+  "spread_check_mandatory": "Never execute if spread exceeds 2.5× the normal spread for that session. risk_manager.check_spread() enforces this. Wide spreads mean liquidity is drying up.",
+
+  "overnight_regime_guard_active": "The overnight regime guard runs zero API calls and only guards against catastrophic regime reversals while a trade is open. It should not close profitable trades — only protect against overnight trend reversals."
+}

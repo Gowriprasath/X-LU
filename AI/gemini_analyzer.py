@@ -1,0 +1,101 @@
+import sys
+import os
+
+# ==========================================
+# 🔬 STANDALONE ANALYSIS TOOL
+# ==========================================
+# This file is a MANUAL diagnostic tool — run it directly from the terminal
+# for a one-shot market analysis snapshot.
+#
+# It is NOT connected to main_bot.py and does NOT execute trades.
+# It does NOT use strategy_logic.py (analytical framework).
+# Use it to: manually inspect AI reasoning, debug memory, or test prompts.
+#
+# To run: python AI/gemini_analyzer.py
+# ==========================================
+
+base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Fixed typo: "Python FIles" -> "Python Files"
+sys.path.append(os.path.join(base_dir, "Python Files"))
+sys.path.append(os.path.join(base_dir, "Strategy"))
+sys.path.append(os.path.join(base_dir, "Memory"))
+
+import data_extractor
+import memory_manager
+import strategy_rules
+from datetime import datetime
+from google import genai
+
+# ==========================================
+# ⚙️ CONFIGURATION
+# ==========================================
+# ⚠️ WARNING: Never upload this key to GitHub or public servers!
+from dotenv import load_dotenv
+load_dotenv()
+API_KEY = os.getenv("GEMINI_API_KEY")  # FIX #14: Load from .env
+
+def run_smart_analysis():
+    print("🔄 Initializing XAU/USD Algorithmic Pipeline...")
+    
+    # 1. Pull the Live Math from MT5
+    market_context = data_extractor.get_live_market_data() 
+    if not market_context:
+        print("❌ Could not get live market data.")
+        return
+
+    # ---> 💾 SAVE CONTEXT FOR THE REVIEWER <---
+    # Fixed: Now specifically targets the AI folder
+    context_path = os.path.join(base_dir, "AI", "latest_context.txt")
+    with open(context_path, "w", encoding="utf-8") as file:
+        file.write(market_context)
+    # ------------------------------------------
+
+    # 2. Retrieve Past Lessons from the JSON Memory Bank
+    print("📖 Searching Memory Bank for past setups...")
+    past_lessons = memory_manager.get_recent_memories(limit=3)
+
+    print("🧠 Sending Live Data + Memories to Gemini Logic Engine...")
+    client = genai.Client(api_key=API_KEY)
+    
+    # FIX #1: Corrected function name — get_ict_rules() does not exist
+    my_strategy_rules = strategy_rules.get_execution_rules()
+    
+    # Grab the exact current day from your computer's clock
+    current_day = datetime.now().strftime("%A")
+
+    # 4. The Master Prompt (Live Data + Strategy + Memory + Clock)
+    prompt = f"""
+    You are an expert algorithmic ICT trader. Review the precise mathematical data below. 
+
+    --- LIVE CALENDAR ---
+    Today is strictly: {current_day}
+    
+    {market_context}
+    
+    --- MY STRATEGY RULES ---
+    {my_strategy_rules}
+    
+    --- PAST LESSONS & MEMORY ---
+    Read these past trades to avoid making the same mistakes and check where we can enter this to get profit instead of loss. Adjust your current bias and entry.
+    If today's setup closely matches a failed setup from the past.
+    {past_lessons}
+    
+    Based ONLY on the live data, my rules, and the past lessons, provide a clear 
+    breakdown of the current setup. If a valid trade exists, output the entry, stop loss, and target.
+    """
+    
+    # Using the fast Flash model for rapid processing
+    response = client.models.generate_content(
+        model='gemini-2.5-flash',
+        contents=prompt
+    )
+    
+    print("\n" + "="*60)
+    print(" 🤖 ICT GOLD ANALYSIS (MEMORY ENHANCED)")
+    print("="*60)
+    print(response.text)
+    print("="*60)
+
+if __name__ == "__main__":
+    run_smart_analysis()

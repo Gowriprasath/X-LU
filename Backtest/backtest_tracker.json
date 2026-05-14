@@ -1,0 +1,16 @@
+{
+    "last_processed_candle": null,
+    "candles_processed": 0,
+    "started_at": null,
+    "last_saved": null,
+    "stats": {
+        "total_trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "total_pnl": 0.0,
+        "api_calls": 0,
+        "skipped_dead_zone": 0,
+        "skipped_prefilter": 0,
+        "london_blocked": 0
+    }
+}

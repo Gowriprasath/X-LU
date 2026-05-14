@@ -1,0 +1,9 @@
+{
+    "python.locator": "native",
+    "python.terminal.useEnvFile": true,
+    "python.analysis.extraPaths": [
+        "Python FIles",
+        "Strategy",
+        "Memory"
+    ]
+}
