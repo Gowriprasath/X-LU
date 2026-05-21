@@ -82,6 +82,7 @@ import re
 import argparse
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+load_dotenv()
 import pandas as pd
 
 # ── Path setup ─────────────────────────────────────────────────────
@@ -144,7 +145,7 @@ except ImportError:
     _PROFILER_ENABLED = False
 
 # ── Config ─────────────────────────────────────────────────────────
-load_dotenv()
+# load_dotenv() called at the top of the file to fix import-order validation bug
 # Signal to risk_manager that this is a backtest run — suppresses per-candle
 # "Risk cleared" prints and skips MT5 calls (which hit every active candle).
 os.environ["BACKTEST_MODE"] = "1"

@@ -33,6 +33,7 @@ import re
 import threading
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+load_dotenv()
 # FIX: removed 'from google import genai' — all AI calls go through ai_client.py
 import MetaTrader5 as mt5
 import pandas as pd
@@ -90,7 +91,7 @@ except ImportError:
     print("[MetaLabeller] ✗ Not available — running without meta layer.")
 
 # --- Config ---
-load_dotenv()
+# load_dotenv() called at the top of the file to fix import-order validation bug
 from master_controls import (
     GATE_MIN_CONFIDENCE, GATE_MAX_CONSECUTIVE_WAITS, GATE_LONDON_MIN_CONFLUENCE,
     GATE_MIN_RR, GATE_MAX_ENTRY_DEVIATION, GATE_MAX_SPREAD_DOLLARS,
