@@ -20,41 +20,31 @@ _root_tl = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file_
 if _root_tl not in sys.path:
     sys.path.insert(0, _root_tl)
 from paths import CONTINUATION_MEM_PATH
+from Stability.file_lock_registry import read_json, write_json
 
 STATE_FILE = CONTINUATION_MEM_PATH
 
 
 def get_current_state():
-    if not os.path.exists(STATE_FILE):
-        return {
-            "current_bias": "NEUTRAL", 
-            "active_thesis": "No previous data found.",
-            "trade_in_progress": False
-        }
-        
     try:
-        with open(STATE_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
+        state = read_json(STATE_FILE)
+        if state:
+            return state
     except Exception as e:
         print(f"⚠️ Error reading continuation memory: {e}")
-        return {
-            "current_bias": "NEUTRAL", 
-            "active_thesis": "Error reading state.",
-            "trade_in_progress": False
-        }
+        
+    return {
+        "current_bias": "NEUTRAL", 
+        "active_thesis": "No previous data found.",
+        "trade_in_progress": False
+    }
 
 def update_state(bias, thesis, analysis, trade_active):
     # BUG-7 FIX: Lock the entire read-modify-write so concurrent calls
     # (main thread + post-mortem daemon) cannot interleave writes.
     with _state_lock:
         # 🚀 FIX: Read existing state first so we don't wipe partial_close_event
-        state = {}
-        if os.path.exists(STATE_FILE):
-            try:
-                with open(STATE_FILE, 'r', encoding='utf-8') as f:
-                    state = json.load(f)
-            except Exception:
-                pass
+        state = read_json(STATE_FILE) or {}
 
         # Update only the thought-logger fields
         state["current_bias"]          = bias
@@ -64,8 +54,7 @@ def update_state(bias, thesis, analysis, trade_active):
         state["last_update"]           = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         try:
-            with open(STATE_FILE, 'w', encoding='utf-8') as f:
-                json.dump(state, f, indent=4)
+            write_json(STATE_FILE, state)
             return True
         except Exception as e:
             print(f"❌ Failed to update continuation memory: {e}")

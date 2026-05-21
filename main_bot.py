@@ -130,6 +130,7 @@ from ai_client import call_ai, get_client, AI_MODEL
 SYMBOL   = "XAUUSD"
 NY_TZ    = pytz.timezone('America/New_York')
 from paths import CONTINUATION_MEM_PATH as STATE_FILE, create_all_dirs as _cad_mb
+from Stability.file_lock_registry import read_json, write_json
 _cad_mb()
 
 _active_trade = {
@@ -231,9 +232,9 @@ def seconds_until_next_window():
 # ================================================================
 def _get_last_partial_close_event():
     try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f).get('last_partial_close_event', '')
+        state = read_json(STATE_FILE)
+        if state:
+            return state.get('last_partial_close_event', '')
     except Exception:
         pass
     return ''
@@ -247,17 +248,10 @@ def _set_last_partial_close_event(event_tag):
     # within the same ~1ms window produced a truncated or event-tag-less JSON,
     # causing the duplicate-close guard to fire again on the very next cycle.
     with _partial_close_lock:
-        state = {}
-        if os.path.exists(STATE_FILE):
-            try:
-                with open(STATE_FILE, 'r', encoding='utf-8') as f:
-                    state = json.load(f)
-            except Exception:
-                pass
+        state = read_json(STATE_FILE) or {}
         state['last_partial_close_event'] = event_tag
         try:
-            with open(STATE_FILE, 'w', encoding='utf-8') as f:
-                json.dump(state, f, indent=4)
+            write_json(STATE_FILE, state)
         except Exception as e:
             print(f"Could not persist partial close guard: {e}")
 
@@ -295,7 +289,7 @@ def _get_regime():
     try:
         if mt5.initialize():
             try:
-                m5_rates = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_M5, 0, 500)
+                m5_rates = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_M5, 0, 1000)
                 h1_rates = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_H1, 0, 300)
                 h4_rates = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_H4, 0, 250)
                 d1_rates = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_D1, 0, 250)

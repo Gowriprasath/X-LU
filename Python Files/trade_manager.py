@@ -47,6 +47,8 @@ import re
 current_dir = os.path.dirname(os.path.abspath(__file__))
 base_dir    = os.path.dirname(current_dir)
 sys.path.append(current_dir)
+if base_dir not in sys.path:
+    sys.path.append(base_dir)
 
 from trade_executor import modify_position_sl, partial_close, close_position, MAGIC_NUMBER
 
@@ -55,6 +57,7 @@ from trade_executor import modify_position_sl, partial_close, close_position, MA
 sys.path.append(os.path.join(base_dir, 'Memory'))
 from memory_manager import _memory_lock as _state_lock
 
+from Stability.file_lock_registry import read_json, write_json
 from paths import TRADE_MEMORY_PATH
 MEMORY_FILE = TRADE_MEMORY_PATH
 
@@ -93,10 +96,9 @@ def _read_mgmt_state(ticket):
         "management_stage": 0,
     }
     try:
-        if not os.path.exists(MEMORY_FILE):
+        memory_data = read_json(MEMORY_FILE)
+        if not memory_data:
             return defaults
-        with open(MEMORY_FILE, 'r', encoding='utf-8') as f:
-            memory_data = json.load(f)
         for trade in memory_data:
             if str(trade.get('ticket')) == str(ticket):
                 mgmt = trade.get('management_state', {})
@@ -114,10 +116,9 @@ def _write_mgmt_state(ticket, state_update):
     """
     with _state_lock:
         try:
-            if not os.path.exists(MEMORY_FILE):
+            memory_data = read_json(MEMORY_FILE)
+            if not memory_data:
                 return
-            with open(MEMORY_FILE, 'r', encoding='utf-8') as f:
-                memory_data = json.load(f)
 
             for trade in memory_data:
                 if str(trade.get('ticket')) == str(ticket):
@@ -126,8 +127,7 @@ def _write_mgmt_state(ticket, state_update):
                     trade['management_state'] = existing
                     break
 
-            with open(MEMORY_FILE, 'w', encoding='utf-8') as f:
-                json.dump(memory_data, f, indent=4)
+            write_json(MEMORY_FILE, memory_data)
 
         except Exception as e:
             print(f"[TradeManager] WARNING: Could not persist management state: {e}")

@@ -265,12 +265,23 @@ def predict(h1_df, m5_df=None, h4_df=None, d1_df=None):
             print("[RegimeDetector] Insufficient candles for prediction.")
             return _safe_default()
 
-        latest = features.iloc[[-1]]
+        # ── Apply rolling z-score to TF cols on the entire features DataFrame first ──
+        # This prevents the single-row z-scoring from zeroing out standard deviation.
+        from feature_engineer import apply_rolling_zscore, TF_FEATURE_COLS
+        
+        features_raw = features.copy()
+        
+        tf_cols = [c for c in TF_FEATURE_COLS if c in features.columns]
+        features_z = apply_rolling_zscore(features, cols=tf_cols, window=500)
+        features_z = features_z.fillna(0.0)
+
+        latest_raw = features_raw.iloc[[-1]]
+        latest_z = features_z.iloc[[-1]]
 
         if _mode == "model":
-            return _predict_xgb(latest, state_map=_state_map)
+            return _predict_xgb(latest_z, latest_raw, state_map=_state_map)
         else:
-            return _predict_fallback(latest)
+            return _predict_fallback(latest_raw)
 
     except Exception as e:
         print(f"[RegimeDetector] Error: {e}")
@@ -334,7 +345,7 @@ def _smooth_regime(raw_regime):
     return Counter(_smooth_buffer).most_common(1)[0][0]
 
 
-def _predict_xgb(latest, state_map=None):
+def _predict_xgb(latest_z, latest_raw, state_map=None):
     """
     Two-stage regime prediction pipeline.
 
@@ -354,21 +365,19 @@ def _predict_xgb(latest, state_map=None):
         5. Update persistence tracker with smoothed regime
     """
     try:
-        from feature_engineer import apply_rolling_zscore, TF_FEATURE_COLS
-
         # ── STAGE 1 — REVERSAL binary pre-filter ─────────────────
         # Runs before any feature engineering or persistence injection.
-        # Uses the raw latest row (same features it was trained on).
+        # Uses the z-scored latest row (same features it was trained on).
         # If it fires, we return REVERSAL immediately — no 5-class call needed.
         if _reversal_filter_loaded:
             try:
                 import reversal_detector as _rd
-                fired, rev_prob = _rd.is_reversal(latest)
+                fired, rev_prob = _rd.is_reversal(latest_z)
                 if fired:
                     # Update persistence with REVERSAL and return early
                     candles_since, dur_mean, prev_enc = _update_persistence(REGIME_REVERSAL)
                     _smooth_buffer.clear()   # hard reset — spike overrides smoothing history
-                    log_prediction(REGIME_REVERSAL, rev_prob, latest_features=latest)
+                    log_prediction(REGIME_REVERSAL, rev_prob, latest_features=latest_raw)
                     print(f"[RegimeDetector] REVERSAL ← Stage1 pre-filter "
                           f"P={rev_prob:.2f} ≥ {_rd.REVERSAL_FIRE_THRESHOLD} "
                           f"[binary/XGB]")
@@ -395,18 +404,13 @@ def _predict_xgb(latest, state_map=None):
         pers_cols  = [c for c in cols if c in PERSISTENCE_FEATURE_COLS]
 
         # ── Fill missing base cols ────────────────────────────────
-        missing = [c for c in base_cols if c not in latest.columns]
+        missing = [c for c in base_cols if c not in latest_z.columns]
         if missing:
-            latest = latest.copy()
+            latest_z = latest_z.copy()
             for c in missing:
-                latest[c] = 0.0
+                latest_z[c] = 0.0
             if len(missing) > 5:
                 print(f"[RegimeDetector] WARNING: {len(missing)} cols missing — retrain.")
-
-        # ── Apply rolling z-score to TF cols (matches training) ──
-        tf_in_latest = [c for c in TF_FEATURE_COLS if c in latest.columns]
-        latest = apply_rolling_zscore(latest, cols=tf_in_latest, window=500)
-        latest = latest.fillna(0.0)   # warmup NaNs → 0 for live single-row inference
 
         # ── Build persistence vector (live values from tracker) ──
         # Bug 4 fix: read current tracker state WITHOUT calling _update_persistence()
@@ -433,7 +437,7 @@ def _predict_xgb(latest, state_map=None):
         }
 
         # ── Assemble full feature row ─────────────────────────────
-        row = latest[base_cols].copy()
+        row = latest_z[base_cols].copy()
         for pc in pers_cols:
             row[pc] = pers_vals.get(pc, 0.0)
 
@@ -509,7 +513,7 @@ def _predict_xgb(latest, state_map=None):
               f"[XGB/GMM-HMM v5]")
 
         # Log to drift_log.json — auto_retrainer reads this every 4h
-        log_prediction(smoothed_regime, conf, latest_features=latest)
+        log_prediction(smoothed_regime, conf, latest_features=latest_raw)
 
         result = {
             "regime":        smoothed_regime,
@@ -558,7 +562,7 @@ def _predict_xgb(latest, state_map=None):
             _sess_h = {range(19,24): "Asian", range(0,2): "Asian",
                        range(2,7): "London", range(7,17): "NY"}
             _session = next((s for r, s in _sess_h.items() if _hour in r), "Dead")
-            norm_vol = compute_norm_vol(features_row=latest)
+            norm_vol = compute_norm_vol(features_row=latest_raw)
             result   = enrich_regime_result(result, _session,
                                             signal=None, norm_vol=norm_vol)
         except Exception:
@@ -568,7 +572,7 @@ def _predict_xgb(latest, state_map=None):
 
     except Exception as e:
         print(f"[RegimeDetector] XGBoost predict failed: {e}. Using fallback.")
-        return _predict_fallback(latest)
+        return _predict_fallback(latest_raw)
 
 
 def log_prediction(regime, confidence, latest_features=None):

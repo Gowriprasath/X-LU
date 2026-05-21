@@ -60,6 +60,12 @@ import pytz
 _THIS_DIR     = os.path.dirname(os.path.abspath(__file__))
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
+_integration_path = os.path.join(_THIS_DIR, "Integration")
+if _integration_path not in sys.path:
+    sys.path.append(_integration_path)
+_wisdom_path = os.path.join(_THIS_DIR, "Integration", "Wisdom_Worker")
+if _wisdom_path not in sys.path:
+    sys.path.append(_wisdom_path)
 
 NY_TZ = pytz.timezone("America/New_York")
 
@@ -110,8 +116,7 @@ def check_model_files() -> list:
     results = []
     try:
         from paths import (HMM_PATH, HMM_SCALER_PATH, REGIME_XGB_PATH,
-                           REGIME_SCALER_PATH, LABEL_ENCODER_PATH,
-                           MODEL_META_PATH, SESSION_PROFILES_PATH,
+                           LABEL_ENCODER_PATH, MODEL_META_PATH, SESSION_PROFILES_PATH,
                            REVERSAL_DETECTOR_PATH, REVERSAL_DETECTOR_META_PATH)
     except Exception as e:
         return [_fail("Model paths", f"paths.py import error: {e}")]
@@ -120,7 +125,6 @@ def check_model_files() -> list:
         "GMM-HMM model":       HMM_PATH,
         "HMM scaler":          HMM_SCALER_PATH,
         "XGBoost regime":      REGIME_XGB_PATH,
-        "XGBoost scaler":      REGIME_SCALER_PATH,
         "Label encoder":       LABEL_ENCODER_PATH,
         "Model meta":          MODEL_META_PATH,
         "Session profiles":    SESSION_PROFILES_PATH,
@@ -253,7 +257,7 @@ def check_news_feed() -> list:
                 n_days = len(data) if data else 0
                 meta, _ = _load_json(FF_FETCH_META_PATH)
                 fetched_weeks = len(meta.get("fetched_weeks", [])) if meta else 0
-                last_run = meta.get("last_run", "never") if meta else "never"
+                last_run = (meta.get("last_run") or "never") if meta else "never"
                 results.append(_ok("FF news calendar",
                                    f"{n_days} days, {fetched_weeks} FF-fetched weeks, "
                                    f"last run: {last_run[:10] if last_run != 'never' else 'never'}"))

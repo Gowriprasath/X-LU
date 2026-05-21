@@ -722,7 +722,12 @@ def check_and_run_if_needed(force=False, simulated_time=None, m5_df=None, h1_df=
             ny_now    = get_ny_time()
             today_str = ny_now.strftime("%Y-%m-%d")
 
-            if ny_now.hour >= 17 and _ran_today_date != today_str:
+            if ny_now.weekday() >= 5:
+                # Weekend guard: bypass execution and waiting logs
+                if _ran_today_date != today_str:
+                    print(f"[PostMortem] Weekend detected ({ny_now.strftime('%A')}) — post-mortem deactivated.")
+                    _ran_today_date = today_str
+            elif ny_now.hour >= 17 and _ran_today_date != today_str:
                 if not check_if_run_today():
                     time.sleep(15)
                     if _is_shutting_down():

@@ -32,6 +32,8 @@
 """
 
 import os
+from dotenv import load_dotenv
+load_dotenv()
 
 # ══════════════════════════════════════════════════════════════════════
 # SECTION 1 — AI PROVIDER

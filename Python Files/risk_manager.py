@@ -49,11 +49,12 @@ NEWS_REDUCE_WINDOW_AFTER  = 30
 # RISK STATE PERSISTENCE
 # ================================================================
 
+from Stability.file_lock_registry import read_json, write_json, modify_json
+
 def _read_risk_state():
     try:
         if os.path.exists(RISK_STATE_FILE):
-            with open(RISK_STATE_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
+            return read_json(RISK_STATE_FILE) or {}
     except Exception as e:
         print(f"[RiskManager] Could not read risk state: {e}")
     return {}
@@ -61,31 +62,43 @@ def _read_risk_state():
 
 def _write_risk_state(state):
     try:
-        os.makedirs(os.path.dirname(RISK_STATE_FILE), exist_ok=True)
-        with open(RISK_STATE_FILE, 'w', encoding='utf-8') as f:
-            json.dump(state, f, indent=4)
+        write_json(RISK_STATE_FILE, state)
     except Exception as e:
         print(f"[RiskManager] Could not write risk state: {e}")
 
 
 def _get_or_init_daily_state(balance):
     today_str = datetime.now(NY_TZ).strftime('%Y-%m-%d')
-    state     = _read_risk_state()
-    if state.get('date') != today_str:
-        state = {
-            'date':               today_str,
-            'opening_balance':    round(float(balance), 2),
-            'daily_drawdown_cap': round(float(balance) * DAILY_DRAWDOWN_PCT, 2),
-            'base_risk_pct':      BASE_RISK_PCT,
-            'current_risk_pct':   BASE_RISK_PCT,
-            'consecutive_losses': 0,
-        }
-        _write_risk_state(state)
+    initialized = [None]
+    
+    def update(state):
+        if not state:
+            state = {}
+        if state.get('date') != today_str:
+            state = {
+                'date':               today_str,
+                'opening_balance':    round(float(balance), 2),
+                'daily_drawdown_cap': round(float(balance) * DAILY_DRAWDOWN_PCT, 2),
+                'base_risk_pct':      BASE_RISK_PCT,
+                'current_risk_pct':   BASE_RISK_PCT,
+                'consecutive_losses': 0,
+                'halted':             False,
+                'daily_drawdown_hit': False,
+                'daily_drawdown_pct': 0.0,
+            }
+            initialized[0] = state
+        return state
+
+    modify_json(RISK_STATE_FILE, update)
+    
+    if initialized[0] is not None:
+        state = initialized[0]
         print(f"[RiskManager] New day. Opening balance locked: "
               f"${state['opening_balance']:.2f} | "
               f"Drawdown cap: ${state['daily_drawdown_cap']:.2f} | "
               f"Risk: {state['current_risk_pct']*100:.2f}%")
-    return state
+        
+    return _read_risk_state()
 
 
 # ================================================================
@@ -93,44 +106,48 @@ def _get_or_init_daily_state(balance):
 # ================================================================
 
 def update_trade_result(result):
-    state = _read_risk_state()
-    if not state:
-        print("[RiskManager] No risk state found. Skipping update.")
-        return
-
     result = result.upper()
-
-    if result == 'WIN':
-        if state['current_risk_pct'] < state['base_risk_pct']:
-            new_risk = min(
-                round(state['current_risk_pct'] * 2, 5),
-                state['base_risk_pct']
-            )
-            print(f"[RiskManager] WIN (recovering). Risk: "
-                  f"{state['current_risk_pct']*100:.3f}% → {new_risk*100:.3f}%")
+    
+    def update(state):
+        if not state:
+            return state
+            
+        if result == 'WIN':
+            if state['current_risk_pct'] < state['base_risk_pct']:
+                new_risk = min(
+                    round(state['current_risk_pct'] * 2, 5),
+                    state['base_risk_pct']
+                )
+                print(f"[RiskManager] WIN (recovering). Risk: "
+                      f"{state['current_risk_pct']*100:.3f}% → {new_risk*100:.3f}%")
+                state['current_risk_pct'] = new_risk
+            state['consecutive_losses'] = 0
+    
+        elif result == 'CLOSED_BY_AI':
+            print(f"[RiskManager] CLOSED_BY_AI — neutral result. "
+                  f"Consecutive losses unchanged: {state['consecutive_losses']}")
+    
+        elif result == 'LOSS':
+            state['consecutive_losses'] += 1
+            new_risk = round(state['current_risk_pct'] * 0.5, 5)
+            if new_risk < MIN_RISK_PCT:
+                new_risk = MIN_RISK_PCT
+                print(f"[RiskManager] LOSS #{state['consecutive_losses']}. "
+                      f"Risk floor reached ({MIN_RISK_PCT*100:.1f}%).")
+            else:
+                print(f"[RiskManager] LOSS #{state['consecutive_losses']}. Risk reduced: "
+                      f"{state['current_risk_pct']*100:.2f}% → {new_risk*100:.2f}%")
             state['current_risk_pct'] = new_risk
-        state['consecutive_losses'] = 0
+            
+        return state
 
-    elif result == 'CLOSED_BY_AI':
-        print(f"[RiskManager] CLOSED_BY_AI — neutral result. "
-              f"Consecutive losses unchanged: {state['consecutive_losses']}")
-
-    elif result == 'LOSS':
-        state['consecutive_losses'] += 1
-        new_risk = round(state['current_risk_pct'] * 0.5, 5)
-        if new_risk < MIN_RISK_PCT:
-            new_risk = MIN_RISK_PCT
-            print(f"[RiskManager] LOSS #{state['consecutive_losses']}. "
-                  f"Risk floor reached ({MIN_RISK_PCT*100:.1f}%).")
-        else:
-            print(f"[RiskManager] LOSS #{state['consecutive_losses']}. Risk reduced: "
-                  f"{state['current_risk_pct']*100:.2f}% → {new_risk*100:.2f}%")
-        state['current_risk_pct'] = new_risk
-
-    _write_risk_state(state)
-    print(f"[RiskManager] State updated — "
-          f"Consecutive losses: {state['consecutive_losses']} | "
-          f"Current risk: {state['current_risk_pct']*100:.2f}%")
+    modify_json(RISK_STATE_FILE, update)
+    
+    state = _read_risk_state()
+    if state:
+        print(f"[RiskManager] State updated — "
+              f"Consecutive losses: {state.get('consecutive_losses')} | "
+              f"Current risk: {state.get('current_risk_pct', 0.0)*100:.2f}%")
 
 
 # ================================================================
@@ -269,7 +286,32 @@ def check_risk_clearance(symbol):
         if total_daily_pnl < -drawdown_cap:
             print(f"[RiskManager] DAILY DRAWDOWN CAP HIT: "
                   f"Loss ${abs(total_daily_pnl):.2f} > Cap ${drawdown_cap:.2f}.")
+            current_dd_pct = round(abs(total_daily_pnl) / balance, 5) if balance > 0 else 0.0
+            
+            def update_cap_hit(state):
+                if not state:
+                    state = {}
+                if not state.get("halted") or not state.get("daily_drawdown_hit"):
+                    state["halted"] = True
+                    state["daily_drawdown_hit"] = True
+                    state["daily_drawdown_pct"] = current_dd_pct
+                return state
+                
+            modify_json(RISK_STATE_FILE, update_cap_hit)
             return False
+
+        # If drawdown cap not hit, make sure daily_drawdown_hit is False
+        def update_cap_clear(state):
+            if not state:
+                state = {}
+            if state.get("daily_drawdown_hit"):
+                state["daily_drawdown_hit"] = False
+                state["daily_drawdown_pct"] = 0.0
+                if state.get("consecutive_losses", 0) < MAX_CONSECUTIVE_LOSSES:
+                    state["halted"] = False
+            return state
+            
+        modify_json(RISK_STATE_FILE, update_cap_clear)
 
         if not __import__("os").getenv("BACKTEST_MODE"):
             print(f"[RiskManager] Risk cleared. "
@@ -294,7 +336,27 @@ def check_consecutive_losses(symbol):
     if consecutive >= MAX_CONSECUTIVE_LOSSES:
         print(f"[RiskManager] {MAX_CONSECUTIVE_LOSSES} CONSECUTIVE LOSSES TODAY. "
               f"Trading stopped for the day.")
+        
+        def update_loss_halt(state):
+            if not state:
+                state = {}
+            if not state.get("halted"):
+                state["halted"] = True
+            return state
+            
+        modify_json(RISK_STATE_FILE, update_loss_halt)
         return False
+    
+    def update_loss_clear(state):
+        if not state:
+            state = {}
+        if state.get("halted"):
+            # Make sure we only unhalt if daily drawdown didn't hit it too
+            if not state.get("daily_drawdown_hit"):
+                state["halted"] = False
+        return state
+        
+    modify_json(RISK_STATE_FILE, update_loss_clear)
     return True
 
 
