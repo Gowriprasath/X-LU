@@ -60,7 +60,7 @@ def compute_atr(df, period=14):
 
 def compute_atr_ratio(df, atr_period=14, mean_period=50):
     atr      = compute_atr(df, atr_period)
-    atr_mean = atr.rolling(mean_period).mean()
+    atr_mean = atr.rolling(mean_period, min_periods=max(1, mean_period // 4)).mean()
     return atr, atr / atr_mean.replace(0, np.nan)
 
 
@@ -103,8 +103,8 @@ def compute_emas(df):
 # ================================================================
 def compute_bb_width(df, period=20, std_dev=2.0):
     close  = df['close']
-    middle = close.rolling(period).mean()
-    std    = close.rolling(period).std()
+    middle = close.rolling(period, min_periods=max(1, period // 4)).mean()
+    std    = close.rolling(period, min_periods=max(1, period // 4)).std()
     width  = ((middle + std_dev * std) - (middle - std_dev * std)) / middle.replace(0, np.nan)
     return width
 
@@ -116,7 +116,10 @@ def compute_momentum_features(df, lookback=20):
     close = df['close']
     high, low = df['high'], df['low']
     momentum     = close.pct_change(lookback)
-    rolling_range = (high.rolling(lookback).max() - low.rolling(lookback).min()) / close
+    rolling_range = (
+        high.rolling(lookback, min_periods=max(1, lookback // 4)).max()
+        - low.rolling(lookback, min_periods=max(1, lookback // 4)).min()
+    ) / close
     return momentum, rolling_range
 
 
@@ -197,8 +200,8 @@ def compute_volume_zscore(df, period=20):
         vol = df['volume'].astype(float)
     else:
         return pd.Series(0.0, index=df.index, dtype=float)
-    vol_mean = vol.rolling(period).mean()
-    vol_std  = vol.rolling(period).std()
+    vol_mean = vol.rolling(period, min_periods=max(1, period // 4)).mean()
+    vol_std  = vol.rolling(period, min_periods=max(1, period // 4)).std()
     return (vol - vol_mean) / vol_std.replace(0, np.nan)
 
 
@@ -208,8 +211,8 @@ def compute_volume_zscore(df, period=20):
 def compute_rolling_volatility(df, period_short=20, period_long=100):
     """Returns std of pct_change at two horizons + ratio. Complements ATR."""
     returns  = df['close'].pct_change()
-    rv_short = returns.rolling(period_short).std()
-    rv_long  = returns.rolling(period_long).std()
+    rv_short = returns.rolling(period_short, min_periods=max(1, period_short // 4)).std()
+    rv_long  = returns.rolling(period_long, min_periods=max(1, period_long // 4)).std()
     vol_ratio = rv_short / rv_long.replace(0, np.nan)
     return rv_short, rv_long, vol_ratio
 
@@ -239,7 +242,7 @@ def build_features(df, prefix='h1'):
     f[p+'_atr_raw']       = atr                    # HMM obs only — NOT in FEATURE_COLS
     f[p+'atr_ratio']      = atr_ratio
     f[p+'atr_slope']      = atr.diff(5) / atr.shift(5).abs().replace(0, np.nan)
-    f[p+'atr_percentile'] = atr.rolling(100).apply(
+    f[p+'atr_percentile'] = atr.rolling(100, min_periods=max(1, 100 // 4)).apply(
         lambda x: (x[:-1] < x[-1]).sum() / max(len(x) - 1, 1), raw=True)
 
     bb_width = compute_bb_width(df)
@@ -493,8 +496,8 @@ def apply_rolling_zscore(df, cols=None, window=500):
         cols = [c for c in TF_FEATURE_COLS if c in df.columns]
 
     for col in cols:
-        rm  = df[col].rolling(window, min_periods=window // 2).mean()
-        rs  = df[col].rolling(window, min_periods=window // 2).std()
+        rm  = df[col].rolling(window, min_periods=max(1, window // 4)).mean()
+        rs  = df[col].rolling(window, min_periods=max(1, window // 4)).std()
         df[col] = (df[col] - rm) / rs.replace(0, 1e-8)   # BUG FIX: was replace(0, np.nan)
 
     return df

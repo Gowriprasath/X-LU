@@ -90,6 +90,28 @@ except ImportError:
     _META_ENABLED = False
     print("[MetaLabeller] ✗ Not available — running without meta layer.")
 
+# ── Stability Layer ──────────────────────────────
+from startup_validator import run_validation
+from file_lock_registry import read_json, write_json
+from console_display import (
+    print_boot_banner, print_critical, print_warning,
+    print_trade_open, print_trade_close,
+    print_sl_update, print_partial_close,
+    print_memory_event, print_retrain,
+    print_pnl_update, print_cycle,
+    print_outage_banner, print_recovery_banner,
+    print_session_summary, print_wisdom_update
+)
+from telegram_notifier import (
+    send_startup_alert, send_halt_alert,
+    send_trade_opened, send_trade_closed,
+    send_sl_update, send_partial_close,
+    send_session_summary, send_pnl_update,
+    send_wisdom_updated, send_postmortem
+)
+from mt5_heartbeat import check_mt5_health
+from ai_client import is_ai_available, get_ai_status
+
 # --- Config ---
 # load_dotenv() called at the top of the file to fix import-order validation bug
 from master_controls import (
@@ -331,14 +353,35 @@ def _handle_broker_close():
                 mt5.shutdown()  # FIX Bug 1: guaranteed shutdown
             trade_result = "WIN"
             pnl_dollars  = 0.0
+            close_price  = _active_trade.get("entry", 0.0)
             if deals:
                 for deal in reversed(deals):
                     if (deal.position_id == _active_trade["ticket"] and
                             deal.entry in (mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_INOUT)):
                         pnl_dollars  = float(deal.profit) + float(deal.commission) + float(deal.swap)
+                        close_price  = float(getattr(deal, "price", _active_trade.get("entry", 0.0)))
                         trade_result = "WIN" if pnl_dollars >= 0 else "LOSS"
                         break
             print(f"[Main] Broker closed trade. Result: {trade_result}")
+            _pnl_pips = 0.0
+            try:
+                _entry = float(_active_trade.get("entry", 0.0))
+                if _entry > 0 and _active_trade.get("type") == "BUY":
+                    _pnl_pips = (close_price - _entry) * 10.0
+                elif _entry > 0 and _active_trade.get("type") == "SELL":
+                    _pnl_pips = (_entry - close_price) * 10.0
+            except Exception:
+                _pnl_pips = 0.0
+            _tg_close = {
+                "direction": _active_trade.get("type", "N/A"),
+                "entry": _active_trade.get("entry", 0),
+                "exit_price": close_price,
+                "lot": _active_trade.get("lot", 0),
+                "session": get_current_session() or "N/A",
+                "ticket": _active_trade.get("ticket", 0),
+            }
+            print_trade_close(_tg_close, pnl_dollars, _pnl_pips)
+            send_trade_closed(_tg_close, pnl_dollars, _pnl_pips)
             risk_manager.update_trade_result(trade_result)
             memory_manager.update_final_review(
                 _active_trade["ticket"], trade_result,
@@ -420,6 +463,53 @@ def run_overnight_trade_guard():
 
     # REVERSAL hardcoded close already executed inside manage_trade — clean up here
     if mgmt_result.get("force_close"):
+        # ── Notify: Force Close ──────────────────────────
+        try:
+            import MetaTrader5 as _mt5_fc
+            _fc_close_price = 0.0
+            _fc_pnl_dollars = 0.0
+            _fc_pnl_pips    = 0.0
+            _fc_ticket      = _active_trade.get("ticket", 0)
+            
+            if _fc_ticket and _mt5_fc.initialize():
+                _fc_deals = _mt5_fc.history_deals_get(
+                    position=_fc_ticket
+                )
+                if _fc_deals and len(_fc_deals) > 0:
+                    # Last deal is the closing deal
+                    _last_deal       = _fc_deals[-1]
+                    _fc_close_price  = _last_deal.price
+                    _fc_pnl_dollars  = _last_deal.profit
+                    _fc_entry        = _active_trade.get("entry", 0)
+                    _fc_direction    = _active_trade.get("type", "")
+                    if _fc_entry and _fc_close_price:
+                        if _fc_direction == "BUY":
+                            _fc_pnl_pips = (
+                              (_fc_close_price - _fc_entry) * 10.0
+                            )
+                        elif _fc_direction == "SELL":
+                            _fc_pnl_pips = (
+                              (_fc_entry - _fc_close_price) * 10.0
+                            )
+                _mt5_fc.shutdown()
+            
+            _fc_trade_dict = {
+                "direction"  : _active_trade.get("type",   "N/A"),
+                "entry"      : _active_trade.get("entry",  0),
+                "exit_price" : _fc_close_price,
+                "lot"        : _active_trade.get("lot",    0),
+                "session"    : get_current_session() or "N/A",
+                "ticket"     : _fc_ticket,
+            }
+            
+            print_trade_close(_fc_trade_dict, 
+                              _fc_pnl_dollars, 
+                              _fc_pnl_pips)
+            send_trade_closed(_fc_trade_dict, 
+                              _fc_pnl_dollars, 
+                              _fc_pnl_pips)
+        except Exception:
+            pass   # never let notification crash trade mgmt
         memory_manager.update_final_review(
             _active_trade["ticket"], "CLOSED_BY_AI",
             f"Overnight guard hybrid REVERSAL close. {mgmt_result['action_taken']}"
@@ -438,6 +528,18 @@ def run_overnight_trade_guard():
         if _get_last_partial_close_event() != event_tag:
             print(f"[OvernightGuard] RegimeRouter: {adapt['reason']}")
             trade_executor.close_partial_position(SYMBOL, close_pct=0.5)
+            _lots_closed = float(_active_trade.get("lot", 0.0)) * 0.5
+            _lots_remaining = max(float(_active_trade.get("lot", 0.0)) - _lots_closed, 0.0)
+            print_partial_close(
+                ticket=_active_trade.get("ticket", 0),
+                lots_closed=_lots_closed,
+                remaining=_lots_remaining
+            )
+            send_partial_close(
+                ticket=_active_trade.get("ticket", 0),
+                lots_closed=_lots_closed,
+                remaining=_lots_remaining
+            )
             _set_last_partial_close_event(event_tag)
     elif adapt["action"] == "TIGHTEN_TP" and adapt.get("new_tp"):
         print(f"[OvernightGuard] RegimeRouter TIGHTEN_TP → {adapt['new_tp']:.2f}")
@@ -447,6 +549,18 @@ def run_overnight_trade_guard():
         from trade_executor import modify_position_sl
         if modify_position_sl(_active_trade["ticket"], SYMBOL, adapt["new_sl"]):
             _active_trade["sl"] = adapt["new_sl"]
+            _new_sl = adapt["new_sl"]
+            _sl_reason = adapt.get("reason", "RegimeRouter WIDEN_SL")
+            print_sl_update(
+                ticket=_active_trade.get("ticket", 0),
+                new_sl=_new_sl,
+                reason=_sl_reason
+            )
+            send_sl_update(
+                ticket=_active_trade.get("ticket", 0),
+                new_sl=_new_sl,
+                reason=_sl_reason
+            )
 
     # BULL/BEAR counter-direction check (overnight only — not covered by hybrid dispatch)
     if regime in ("BULL_TREND", "BEAR_TREND") and confidence >= 0.80:
@@ -542,6 +656,18 @@ def check_open_position_news_rule(news_data):
                 if _get_last_partial_close_event() != event_tag:
                     print("Partial close triggered (one-time per news event).")
                     trade_executor.close_partial_position(SYMBOL, close_pct=0.5)
+                    _lots_closed = float(_active_trade.get("lot", 0.0)) * 0.5
+                    _lots_remaining = max(float(_active_trade.get("lot", 0.0)) - _lots_closed, 0.0)
+                    print_partial_close(
+                        ticket=_active_trade.get("ticket", 0),
+                        lots_closed=_lots_closed,
+                        remaining=_lots_remaining
+                    )
+                    send_partial_close(
+                        ticket=_active_trade.get("ticket", 0),
+                        lots_closed=_lots_closed,
+                        remaining=_lots_remaining
+                    )
                     _set_last_partial_close_event(event_tag)
     except Exception:
         pass
@@ -626,6 +752,11 @@ def run_trading_cycle(high_precautions=False):
     session = get_current_session()
     print(f"\n--- CYCLE: {now.strftime('%H:%M:%S')} NY | "
           f"Session: {session or 'DEAD ZONE'} ---")
+
+    # ── MT5 Heartbeat ────────────────────────────────
+    if not check_mt5_health():
+        print_warning("MT5 unhealthy — skipping this cycle.")
+        return True   # skip cycle, main loop will retry
 
     # Strategy Scout: non-blocking pending proposal ping every cycle
     try:
@@ -725,12 +856,79 @@ def run_trading_cycle(high_precautions=False):
         )
         _active_trade["management_stage"] = mgmt_result["stage"]
         _active_trade["sl"]               = mgmt_result["sl_price"]
+        # ── Notify: SL Updated ───────────────────────────
+        try:
+            _notify_new_sl     = mgmt_result.get("sl_price", 0)
+            _notify_sl_reason  = mgmt_result.get(
+                                   "action_taken",
+                                   "Trade manager SL update"
+                                 )
+            if _notify_new_sl and _notify_new_sl != 0:
+                print_sl_update(
+                    ticket = _active_trade.get("ticket", 0),
+                    new_sl = _notify_new_sl,
+                    reason = _notify_sl_reason
+                )
+                send_sl_update(
+                    ticket = _active_trade.get("ticket", 0),
+                    new_sl = _notify_new_sl,
+                    reason = _notify_sl_reason
+                )
+        except Exception:
+            pass   # never let notification crash trade mgmt
         _path = mgmt_result.get("hybrid_action", "MECHANICAL")
         print(f"[TradeManager/{_path}] {mgmt_result['action_taken']}")
 
         # REVERSAL hardcoded close: manage_trade already sent the close order.
         # We still need to update memory + reset _active_trade here.
         if mgmt_result.get("force_close"):
+            # ── Notify: Force Close ──────────────────────────
+            try:
+                import MetaTrader5 as _mt5_fc
+                _fc_close_price = 0.0
+                _fc_pnl_dollars = 0.0
+                _fc_pnl_pips    = 0.0
+                _fc_ticket      = _active_trade.get("ticket", 0)
+                
+                if _fc_ticket and _mt5_fc.initialize():
+                    _fc_deals = _mt5_fc.history_deals_get(
+                        position=_fc_ticket
+                    )
+                    if _fc_deals and len(_fc_deals) > 0:
+                        # Last deal is the closing deal
+                        _last_deal       = _fc_deals[-1]
+                        _fc_close_price  = _last_deal.price
+                        _fc_pnl_dollars  = _last_deal.profit
+                        _fc_entry        = _active_trade.get("entry", 0)
+                        _fc_direction    = _active_trade.get("type", "")
+                        if _fc_entry and _fc_close_price:
+                            if _fc_direction == "BUY":
+                                _fc_pnl_pips = (
+                                  (_fc_close_price - _fc_entry) * 10.0
+                                )
+                            elif _fc_direction == "SELL":
+                                _fc_pnl_pips = (
+                                  (_fc_entry - _fc_close_price) * 10.0
+                                )
+                    _mt5_fc.shutdown()
+                
+                _fc_trade_dict = {
+                    "direction"  : _active_trade.get("type",   "N/A"),
+                    "entry"      : _active_trade.get("entry",  0),
+                    "exit_price" : _fc_close_price,
+                    "lot"        : _active_trade.get("lot",    0),
+                    "session"    : get_current_session() or "N/A",
+                    "ticket"     : _fc_ticket,
+                }
+                
+                print_trade_close(_fc_trade_dict, 
+                                  _fc_pnl_dollars, 
+                                  _fc_pnl_pips)
+                send_trade_closed(_fc_trade_dict, 
+                                  _fc_pnl_dollars, 
+                                  _fc_pnl_pips)
+            except Exception:
+                pass   # never let notification crash trade mgmt
             memory_manager.update_final_review(
                 _active_trade["ticket"], "CLOSED_BY_AI",
                 f"Hybrid manager REVERSAL close. {mgmt_result['action_taken']}"
@@ -974,21 +1172,35 @@ def run_trading_cycle(high_precautions=False):
 
     # 10. Call AI  (provider + model set in master_controls.py)
     decision = {}
+    # ── AI Availability Gate ─────────────────────────
+    _ai_available_now = is_ai_available()
+    if not _ai_available_now:
+        print_outage_banner()
+        # Do not return — trade management has already run above.
     try:
-        raw_text = call_ai(prompt=prompt)
-        if raw_text is None:
-            raise RuntimeError(f"{AI_DISPLAY_NAME} call returned None")
-        raw      = re.sub(r'```json\s*', '', raw_text)
-        raw      = re.sub(r'```\s*',     '', raw)
-        candidates = re.findall(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', raw, re.DOTALL)
-        for candidate in reversed(candidates):
-            try:
-                decision = json.loads(candidate)
-                break
-            except json.JSONDecodeError:
-                continue
-        if not decision:
-            decision = json.loads(raw.strip())
+        if _ai_available_now:
+            raw_text = call_ai(prompt=prompt)
+            if raw_text is None:
+                raise RuntimeError(f"{AI_DISPLAY_NAME} call returned None")
+            raw      = re.sub(r'```json\s*', '', raw_text)
+            raw      = re.sub(r'```\s*',     '', raw)
+            candidates = re.findall(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', raw, re.DOTALL)
+            for candidate in reversed(candidates):
+                try:
+                    decision = json.loads(candidate)
+                    break
+                except json.JSONDecodeError:
+                    continue
+            if not decision:
+                decision = json.loads(raw.strip())
+        else:
+            decision = {
+                "signal": "WAIT",
+                "bias": "NEUTRAL",
+                "confluence_score": 0,
+                "thesis": "AI unavailable — outage mode (manage-only).",
+                "reasoning": "Circuit breaker active or AI outage."
+            }
     except Exception as e:
         print(f"AI call / JSON parse error: {e}")
         return True
@@ -1048,8 +1260,13 @@ def run_trading_cycle(high_precautions=False):
         except Exception:
             pass
 
-    print(f"AI: {signal} | Bias: {decision.get('bias')} | "
-          f"Score: {decision.get('confluence_score')} | Session: {session}")
+    print_cycle(
+        regime=regime_result.get("regime", "N/A"),
+        confidence=(regime_result.get("confidence") or 0) * 100,
+        session=session or "N/A",
+        result=signal,
+        reason=decision.get("reasoning", decision.get("thesis", ""))
+    )
     print(f"Thesis: {decision.get('thesis', 'No thesis.')}")
 
     # 11. CLOSE
@@ -1387,6 +1604,21 @@ def run_trading_cycle(high_precautions=False):
                             "management_stage": 0,
                             "regime_at_entry":  regime_result.get("regime"),   # NEW v12
                         }
+                        # ── Notify: Trade Opened ─────────────────────────
+                        _tg_trade = {
+                            "direction": _active_trade.get("type", "N/A"),
+                            "entry": _active_trade.get("entry", 0),
+                            "sl": _active_trade.get("sl", 0),
+                            "tp": _active_trade.get("tp", 0),
+                            "lot": _active_trade.get("lot", 0),
+                            "regime_confidence": round((regime_result.get("confidence") or 0) * 100),
+                            "session": session if session else "N/A",
+                            "ticket": _active_trade.get("ticket", 0),
+                        }
+                        _tg_regime = regime_result.get("regime", "N/A")
+                        _tg_meta = (meta_result.get("meta_prob", 0.0) if meta_result else 0.0)
+                        print_trade_open(_tg_trade)
+                        send_trade_opened(_tg_trade, _tg_regime, _tg_meta)
 
     # 13. Update thought state
     thought_logger.update_state(
@@ -1498,6 +1730,10 @@ def get_sleep_duration():
 # MAIN LOOP
 # ================================================================
 if __name__ == "__main__":
+    # ── Startup Validation ───────────────────────────
+    if not run_validation():
+        sys.exit(1)
+
     try:
         from Bootlogo import boot_trident_79
         boot_trident_79()
@@ -1506,6 +1742,24 @@ if __name__ == "__main__":
         print("⚡ Gold AI Bridge v18 | Regime Router Active")
 
     startup_sync()
+
+    try:
+        from ai_client import _load_keys
+        _n_keys = len(_load_keys())
+    except Exception:
+        _n_keys = 3
+
+    print_boot_banner(
+        model=AI_MODEL,
+        symbol=SYMBOL,
+        keys_loaded=_n_keys,
+        regime_mode="AUTO"
+    )
+    send_startup_alert(
+        symbol=SYMBOL,
+        model=AI_MODEL,
+        regime_mode="AUTO"
+    )
 
     # ── Daily news refresh daemon ──────────────────────────────────
     # Fetches today's USD news immediately at startup, then refreshes
@@ -1594,6 +1848,8 @@ if __name__ == "__main__":
             print(f"   [{_name}] {status}")
 
         # Clean up MT5 connection
+        send_halt_alert("Manual shutdown (KeyboardInterrupt)")
+        print_critical("Bot shutting down — Telegram notified.")
         try:
             if mt5.initialize():
                 mt5.shutdown()

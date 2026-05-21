@@ -43,6 +43,7 @@ Data/ folder sits OUTSIDE the code tree, at the project root:
 """
 
 import os
+import sys
 
 # ══════════════════════════════════════════════════════════════════════
 # PROJECT ROOT
@@ -50,6 +51,11 @@ import os
 # This file lives at the project root (same level as main_bot.py).
 # All code paths that need PROJECT_ROOT can import it from here.
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+# Stability layer
+_STABILITY_DIR = os.path.join(PROJECT_ROOT, "Stability")
+if _STABILITY_DIR not in sys.path:
+    sys.path.insert(0, _STABILITY_DIR)
 
 # ══════════════════════════════════════════════════════════════════════
 # DATA ROOT — CHANGE THIS ONE LINE TO RELOCATE EVERYTHING

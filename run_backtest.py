@@ -113,6 +113,23 @@ def preflight_check(skip_download):
             ok = False
 
     # ── Required scripts ───────────────────────────────────────────
+    # Verify keys are actually readable
+    from dotenv import load_dotenv
+    load_dotenv()
+    _k1 = os.getenv('CLAUDE_API_KEY_1', '')
+    _k2 = os.getenv('CLAUDE_API_KEY_2', '')
+    _k3 = os.getenv('CLAUDE_API_KEY_3', '')
+    _keys_found = sum(1 for k in [_k1, _k2, _k3] if k.strip())
+    if _keys_found == 0:
+        print("[Backtest] ❌ CRITICAL: No Claude API keys "
+              "found in .env — all AI calls will fail.")
+        print("           Set CLAUDE_API_KEY_1 in .env "
+              "and restart.")
+        sys.exit(1)
+    else:
+        print(f"[Backtest] ✓ {_keys_found} API key(s) "
+              f"found in .env")
+
     for path, label in [
         (DOWNLOADER, 'data_downloader.py'),
         (TRAINER,    'trainer.py'),
@@ -260,6 +277,21 @@ def main():
         print("  Full 9-year run. Estimated time: several hours.\n")
         print("  💡 Tip: If interrupted, re-run with --resume to continue.\n")
         print("  💰 Estimated API cost: $80–100 on Claude 2.5 Flash.\n")
+
+    # â”€â”€ Reset circuit breaker for clean backtest run â”€â”€
+    # The circuit breaker is designed for live trading.
+    # In backtest mode it must always start fresh so
+    # every valid signal gets a Claude evaluation.
+    try:
+        from ai_client import _cb_lock
+        import ai_client as _ac
+        with _cb_lock:
+            _ac._cb_tripped           = False
+            _ac._cb_consecutive_fails = 0
+            _ac._cb_tripped_at        = 0.0
+        print("[Backtest] Circuit breaker reset — clean AI state.")
+    except Exception as _cb_e:
+        print(f"[Backtest] Could not reset circuit breaker: {_cb_e}")
 
     engine_args = []
     if args.date_from: engine_args += ['--from', args.date_from]

@@ -314,7 +314,10 @@ def _get_transition_prob(prev_regime, curr_regime, state_map):
     curr_s = regime_to_state.get(curr_regime)
     if prev_s is None or curr_s is None:
         return 0.5
-    return float(_persistence_transmat[prev_s, curr_s])
+    try:
+        return float(_persistence_transmat[int(prev_s), int(curr_s)])
+    except (ValueError, TypeError, IndexError):
+        return 0.5
 
 
 def _smooth_regime(raw_regime):

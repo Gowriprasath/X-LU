@@ -212,6 +212,10 @@ _stats = {
     "london_blocked": 0,
     "dual_gate_blocked": 0,
     "meta_gate_blocked": 0,
+    "confidence_gate_blocked": 0,
+    "claude_wait_blocked":     0,
+    "hallucination_blocked":   0,
+    "rr_blocked":              0,
     "total_spread_cost": 0.0,       # cumulative spread paid across all trades
     "total_slippage_cost": 0.0,     # cumulative slippage paid across all trades
 }
@@ -396,6 +400,48 @@ def validate_trade_logic(decision, current_price):
     return True
 
 
+def _diagnose_trade_failure(decision, current_price):
+    """
+    Called only when validate_trade_logic() returns False.
+    Returns one of: "hallucination", "rr", "levels"
+    so the caller can increment the right counter.
+
+    "hallucination" — entry price too far from live price
+    "rr"            — risk:reward below minimum
+    "levels"        — sl/tp/entry arrangement invalid
+    """
+    signal = decision.get("signal", "WAIT").upper()
+    if signal not in ["BUY", "SELL"]:
+        return "levels"
+
+    entry = float(decision.get("entry", 0))
+    sl    = float(decision.get("sl",    0))
+    tp    = float(decision.get("tp",    0))
+
+    if entry <= 0 or sl <= 0 or tp <= 0:
+        return "levels"
+
+    # Check hallucination first (entry vs current price)
+    if abs(entry - current_price) > 20:
+        return "hallucination"
+
+    # Check RR
+    sl_dist = abs(entry - sl)
+    if sl_dist == 0:
+        return "levels"
+    rr = abs(tp - entry) / sl_dist
+    if rr < 1.5:
+        return "rr"
+
+    # Check price arrangement
+    if signal == "BUY" and not (sl < entry < tp):
+        return "levels"
+    if signal == "SELL" and not (tp < entry < sl):
+        return "levels"
+
+    return "levels"  # fallback
+
+
 # ================================================================
 # REGIME DETECTION (from historical H1 data slice)
 # ================================================================
@@ -437,6 +483,11 @@ def should_call_ai(regime_result, session):
     # Gate 1: model has near-zero conviction in structureless market
     if regime == "LOW_VOL_RANGE" and confidence < 0.25:   # FIX Bug 3: was "RANGING" — gate never fired
         return False, "ranging_low_conf"
+
+    from master_controls import GATE_MIN_CONFIDENCE
+    conf = regime_result.get("confidence") or 0
+    if conf < GATE_MIN_CONFIDENCE:
+        return False, "confidence_gate"
 
     # Gate 2: AI already said WAIT repeatedly in exact same regime state
     if (_consecutive_waits >= 3
@@ -796,10 +847,37 @@ def run_backtest(date_from=None, date_to=None, resume=False):
 
     # ── Load all timeframe data ────────────────────────────────────
     print("[Data] Loading historical data...")
-    m5_df  = load_data("M5",  date_from, date_to)
-    h1_df  = load_data("H1",  date_from, date_to)
-    h4_df  = load_data("H4",  date_from, date_to)
-    d1_df  = load_data("D1",  date_from, date_to)
+    from datetime import timedelta
+
+    # Load data with lookback so D1/H4/H1 features
+    # have enough warmup data before date_from.
+    # Trades are still only evaluated from date_from.
+    _D1_LOOKBACK_DAYS = 400   # 250 trading days + buffer
+    _H4_LOOKBACK_DAYS = 60    # 250 H4 bars + buffer
+    _H1_LOOKBACK_DAYS = 30    # 500 H1 bars + buffer
+    _M5_LOOKBACK_DAYS = 5     # 500 M5 bars + buffer
+
+    if date_from is not None:
+        _data_from_m5 = date_from - timedelta(days=_M5_LOOKBACK_DAYS)
+        _data_from_h1 = date_from - timedelta(days=_H1_LOOKBACK_DAYS)
+        _data_from_h4 = date_from - timedelta(days=_H4_LOOKBACK_DAYS)
+        _data_from_d1 = date_from - timedelta(days=_D1_LOOKBACK_DAYS)
+    else:
+        _data_from_m5 = None
+        _data_from_h1 = None
+        _data_from_h4 = None
+        _data_from_d1 = None
+
+    m5_df  = load_data("M5",  _data_from_m5, date_to)
+    h1_df  = load_data("H1",  _data_from_h1, date_to)
+    h4_df  = load_data("H4",  _data_from_h4, date_to)
+    d1_df  = load_data("D1",  _data_from_d1, date_to)
+
+    print(f"[Backtest] Data loaded with lookback:")
+    print(f"  M5 : {len(m5_df):,} rows from {_data_from_m5.date() if _data_from_m5 is not None else 'start'}")
+    print(f"  H1 : {len(h1_df):,} rows from {_data_from_h1.date() if _data_from_h1 is not None else 'start'}")
+    print(f"  H4 : {len(h4_df):,} rows from {_data_from_h4.date() if _data_from_h4 is not None else 'start'}")
+    print(f"  D1 : {len(d1_df):,} rows from {_data_from_d1.date() if _data_from_d1 is not None else 'start'}")
 
     if m5_df.empty:
         print("[ERROR] No M5 data found. Run data_downloader.py first.")
@@ -841,12 +919,24 @@ def run_backtest(date_from=None, date_to=None, resume=False):
     print(f"[Start] {total_candles - start_idx:,} candles to process")
     print(f"[AI]    Provider: {AI_DISPLAY_NAME} ({AI_MODEL})\n")
 
+    _NY_TZ = pytz.timezone("America/New_York")
+    date_from_aware = (
+        _NY_TZ.localize(date_from) if (date_from is not None and date_from.tzinfo is None)
+        else date_from
+    )
+
     # ── Main candle loop ───────────────────────────────────────────
     candle_idx = start_idx
     while candle_idx < total_candles:
         current_time  = m5_df.index[candle_idx]
         current_candle = m5_df.iloc[candle_idx]
         session        = get_session(current_time)
+
+        # Skip lookback warmup period — evaluate only from
+        # the requested date_from
+        if date_from_aware is not None and current_time < date_from_aware:
+            candle_idx += 1
+            continue
 
         # ── Dead zone handling ──────────────────────────────────
         if not session:
@@ -981,6 +1071,8 @@ def run_backtest(date_from=None, date_to=None, resume=False):
         if not should_proceed:
             if skip_reason == "consecutive_wait":
                 _stats["skipped_consecutive_wait"] += 1
+            elif skip_reason == "confidence_gate":
+                _stats["confidence_gate_blocked"] += 1
             else:
                 _stats["skipped_prefilter"] += 1
             _save_progress_if_needed(tracker, candle_idx, current_time)
@@ -1115,6 +1207,10 @@ def run_backtest(date_from=None, date_to=None, resume=False):
         signal = decision.get("signal", "WAIT").upper()
         if signal not in ["BUY", "SELL", "WAIT", "HOLD", "CLOSE"]:
             signal = "WAIT"
+
+        # ── Count Claude WAIT ─────────────────────────────
+        if signal in ("WAIT", "HOLD"):
+            _stats["claude_wait_blocked"] += 1
 
         # Print cycle summary
         print(f"[{current_time.strftime('%Y-%m-%d %H:%M')}] {session:6s} | "
@@ -1362,6 +1458,30 @@ def run_backtest(date_from=None, date_to=None, resume=False):
                                 print(f"  [Episode] start_episode error: {ep_err}")
 
         # ── Update thought state ─────────────────────────────────
+            else:
+                # validate_trade_logic failed — diagnose why
+                _failure = _diagnose_trade_failure(
+                               decision, current_price)
+                if _failure == "hallucination":
+                    _stats["hallucination_blocked"] += 1
+                    print(f"  [HallucinationGate] BLOCKED — "
+                          f"entry {decision.get('entry',0):.2f} "
+                          f"vs live {current_price:.2f} "
+                          f"(>{20:.0f}pt deviation)")
+                elif _failure == "rr":
+                    _stats["rr_blocked"] += 1
+                    _e = float(decision.get("entry", 0))
+                    _s = float(decision.get("sl",    0))
+                    _t = float(decision.get("tp",    0))
+                    _d = abs(_e - _s)
+                    _r = (abs(_t - _e) / _d) if _d > 0 else 0
+                    print(f"  [RRGate] BLOCKED — "
+                          f"RR {_r:.2f} < 1.5 minimum")
+                else:
+                    print(f"  [ValidateGate] BLOCKED — "
+                          f"invalid price levels "
+                          f"(entry/sl/tp arrangement)")
+
         thought_logger.update_state(
             decision.get("bias",      "NEUTRAL"),
             decision.get("thesis",    "No active thesis."),
@@ -1650,44 +1770,123 @@ def _print_final_report():
     pnl    = _stats["total_pnl"]
     wr     = (wins / total * 100) if total > 0 else 0
 
-    # Gate funnel — how many signals each gate filtered
-    signals_generated = (total
-                         + _stats["london_blocked"]
-                         + _stats["dual_gate_blocked"]
-                         + _stats["meta_gate_blocked"])
+    signals_generated = (
+        total
+        + _stats["london_blocked"]
+        + _stats["dual_gate_blocked"]
+        + _stats["meta_gate_blocked"]
+        + _stats["confidence_gate_blocked"]
+        + _stats["claude_wait_blocked"]
+        + _stats["hallucination_blocked"]
+        + _stats["rr_blocked"]
+        + _stats.get("spread_blocked", 0)
+    )
 
-    print("\n" + "=" * 65)
-    print("  BACKTEST COMPLETE — FINAL REPORT")
-    print("=" * 65)
-    print(f"  Total trades     : {total}")
-    print(f"  Wins             : {wins}")
-    print(f"  Losses           : {losses}")
-    print(f"  Win rate         : {wr:.1f}%")
-    print(f"  Total PnL        : ${pnl:+,.2f}")
-    print(f"  Spread cost      : ${_stats['total_spread_cost']:,.2f}  ← "
-          f"session spread + news-spike widening (3–8x during NFP/CPI/FOMC)")
-    print(f"  Slippage cost    : ${_stats['total_slippage_cost']:,.2f}  ← "
-          f"0.3–1.5 pts normal, up to 3.0 pts news (always adverse fill)")
-    _total_drag = _stats['total_spread_cost'] + _stats['total_slippage_cost']
-    print(f"  Total drag       : ${_total_drag:,.2f}")
-    print(f"  PnL pre-drag     : ${pnl + _total_drag:+,.2f}")
+    # Total cycles evaluated by AI (reached Claude call)
+    ai_cycles = (
+        _stats["api_calls"]
+        + _stats["claude_wait_blocked"]
+    )
+
+    # -- Helper: percentage formatter ------------------
+    def _pct(n, total):
+        return f"{n/total*100:.1f}%" if total > 0 else "0.0%"
+
+    total_cycles = (
+        signals_generated
+        + _stats["skipped_dead_zone"]
+        + _stats["skipped_news_window"]
+        + _stats["skipped_prefilter"]
+        + _stats["skipped_consecutive_wait"]
+        + _stats["confidence_gate_blocked"]
+    )
+
     print()
-    print(f"  ── Gate Funnel ──────────────────────────────")
-    print(f"  Signals generated : {signals_generated}")
-    print(f"  News blocked      : {_stats['skipped_news_window']}  ← "
-          f"historical FF calendar applied")
-    print(f"  London blocked    : {_stats['london_blocked']}")
-    print(f"  Dual gate blocked : {_stats['dual_gate_blocked']}")
-    print(f"  Meta gate blocked : {_stats['meta_gate_blocked']}")
-    print(f"  Spread blocked    : {_stats.get('spread_blocked', 0)}  ← "
-          f"spread > ${1.50:.2f} gate (BUG-06 FIX)")
-    print(f"  Executed trades   : {total}")
+    print(f"  -- Gate Funnel (full cycle breakdown) ------")
+    print(f"  Total cycles run       : {total_cycles:,}")
+    print(f"  Dead zone skips        : "
+          f"{_stats['skipped_dead_zone']:,}"
+          f"  ({_pct(_stats['skipped_dead_zone'], total_cycles)})")
+    print(f"  News blocked           : "
+          f"{_stats['skipped_news_window']:,}"
+          f"  ({_pct(_stats['skipped_news_window'], total_cycles)})")
+    print(f"  Pre-filter (HIGH_VOL)  : "
+          f"{_stats['skipped_prefilter']:,}"
+          f"  ({_pct(_stats['skipped_prefilter'], total_cycles)})")
+    print(f"  Consec-WAIT skips      : "
+          f"{_stats['skipped_consecutive_wait']:,}"
+          f"  ({_pct(_stats['skipped_consecutive_wait'], total_cycles)})")
     print()
-    print(f"  ── Engine Stats ─────────────────────────────")
-    print(f"  API calls         : {_stats['api_calls']:,}")
-    print(f"  Dead zone skips   : {_stats['skipped_dead_zone']:,}")
-    print(f"  Pre-filter skips  : {_stats['skipped_prefilter']:,}")
-    print(f"  Consec-WAIT skips : {_stats['skipped_consecutive_wait']:,}")
+    print(f"  -- Cycles that reached AI ------------------")
+    print(f"  AI cycles              : {ai_cycles:,}")
+    print(f"  Confidence gate block  : "
+          f"{_stats['confidence_gate_blocked']:,}"
+          f"  ({_pct(_stats['confidence_gate_blocked'], ai_cycles)})"
+          f"  ? regime model too uncertain")
+    print(f"  Claude said WAIT       : "
+          f"{_stats['claude_wait_blocked']:,}"
+          f"  ({_pct(_stats['claude_wait_blocked'], ai_cycles)})"
+          f"  ? AI found no edge")
+    print()
+    print(f"  -- Claude said BUY/SELL --------------------")
+    directional = (
+        total
+        + _stats["london_blocked"]
+        + _stats["dual_gate_blocked"]
+        + _stats["meta_gate_blocked"]
+        + _stats.get("spread_blocked", 0)
+        + _stats["hallucination_blocked"]
+        + _stats["rr_blocked"]
+    )
+    print(f"  Directional signals    : {directional:,}")
+    print(f"  London gate blocked    : "
+          f"{_stats['london_blocked']:,}"
+          f"  ({_pct(_stats['london_blocked'], directional)})")
+    print(f"  Dual gate blocked      : "
+          f"{_stats['dual_gate_blocked']:,}"
+          f"  ({_pct(_stats['dual_gate_blocked'], directional)})")
+    print(f"  Meta gate blocked      : "
+          f"{_stats['meta_gate_blocked']:,}"
+          f"  ({_pct(_stats['meta_gate_blocked'], directional)})"
+          f"  ? meta-labeller confidence too low")
+    print(f"  Hallucination blocked  : "
+          f"{_stats['hallucination_blocked']:,}"
+          f"  ({_pct(_stats['hallucination_blocked'], directional)})"
+          f"  ? Claude entry >20pt from live price")
+    print(f"  RR gate blocked        : "
+          f"{_stats['rr_blocked']:,}"
+          f"  ({_pct(_stats['rr_blocked'], directional)})"
+          f"  ? risk:reward below 1.5 minimum")
+    print(f"  Spread blocked         : "
+          f"{_stats.get('spread_blocked',0):,}"
+          f"  ({_pct(_stats.get('spread_blocked',0), directional)})")
+    print()
+    print(f"  -- RESULT ----------------------------------")
+    print(f"  Trades executed        : {total:,}")
+    print(f"  Win rate               : {wr:.1f}%")
+    print(f"  Total PnL              : ${pnl:+,.2f}")
+    print()
+    gate_counts = {
+        "Confidence gate"  : _stats["confidence_gate_blocked"],
+        "Claude WAIT"      : _stats["claude_wait_blocked"],
+        "Meta gate"        : _stats["meta_gate_blocked"],
+        "London gate"      : _stats["london_blocked"],
+        "Dual gate"        : _stats["dual_gate_blocked"],
+        "Hallucination"    : _stats["hallucination_blocked"],
+        "RR gate"          : _stats["rr_blocked"],
+        "Spread gate"      : _stats.get("spread_blocked", 0),
+        "News block"       : _stats["skipped_news_window"],
+        "Consec-WAIT"      : _stats["skipped_consecutive_wait"],
+    }
+    dominant = max(gate_counts, key=gate_counts.get)
+    dominant_count = gate_counts[dominant]
+    print(f"  ?  DOMINANT BLOCKER: {dominant} "
+          f"({dominant_count:,} blocks)")
+    print(f"     ? This gate is your primary friction point.")
+    print(f"     ? Review this gate first in debugging.")
+    print()
+    print(f"  -- Engine Stats ----------------------------")
+    print(f"  API calls made    : {_stats['api_calls']:,}")
     print("=" * 65)
 
     # ── Extended PnL analytics ────────────────────────────────────
