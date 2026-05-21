@@ -1,13 +1,22 @@
+"""
+Startup validation for critical bot JSON files.
+"""
+
 import os
 import sys
 import json
 from file_lock_registry import read_json, write_json, register
-from console_display import (print_critical, print_warning, print_memory_event)
+from console_display import (
+    print_critical,
+    print_warning,
+    print_memory_event,
+)
+
 
 CRITICAL_FILES = [
-    "Memory/continuation_memory.json",
-    "Memory/trade_memory.json",
-    "Memory/post_mortem_tracker.json",
+    ("Memory/continuation_memory.json", None),
+    ("Memory/trade_memory.json", None),
+    ("Memory/post_mortem_tracker.json", None),
 ]
 
 NON_CRITICAL_FILES = [
@@ -21,7 +30,7 @@ NON_CRITICAL_FILES = [
 
 
 def _resolve(relative_path: str) -> str:
-    base = os.path.dirname(os.path.abspath(__file__))
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, relative_path)
 
 
@@ -35,17 +44,16 @@ def _validate_file(abs_path: str, is_critical: bool, safe_default) -> str:
     if os.path.exists(backup_path):
         backup_content = read_json(backup_path)
         if backup_content is not None:
-            if write_json(abs_path, backup_content):
-                print_warning(f"Restored from backup: {os.path.basename(abs_path)}")
-                return "RESTORED"
+            write_json(abs_path, backup_content)
+            print_warning(f"Restored from backup: {os.path.basename(abs_path)}")
+            return "RESTORED"
 
     if is_critical:
         return "FAILED"
 
-    if write_json(abs_path, safe_default):
-        print_warning(f"Initialised empty: {os.path.basename(abs_path)}")
-        return "RESTORED"
-    return "FAILED"
+    write_json(abs_path, safe_default)
+    print_warning(f"Initialised empty: {os.path.basename(abs_path)}")
+    return "RESTORED"
 
 
 def run_validation() -> bool:
@@ -57,9 +65,9 @@ def run_validation() -> bool:
     restored_count = 0
     failed_files = []
 
-    for path in CRITICAL_FILES:
+    for path, safe_default in CRITICAL_FILES:
         abs_path = _resolve(path)
-        status = _validate_file(abs_path, is_critical=True, safe_default=None)
+        status = _validate_file(abs_path, is_critical=True, safe_default=safe_default)
         if status == "OK":
             print(f"  ✅  {path}")
             ok_count += 1
@@ -80,7 +88,7 @@ def run_validation() -> bool:
             print(f"  ⚠️   {path}  ← restored from backup")
             restored_count += 1
         elif status == "FAILED":
-            print(f"  ❌  {path}  ← FAILED TO INITIALISE")
+            print(f"  ❌  {path}  ← CORRUPTED, no backup")
             failed_files.append(path)
 
     print("=" * 56)
@@ -92,9 +100,13 @@ def run_validation() -> bool:
     if failed_files:
         for failed_path in failed_files:
             print_critical(
-                f"HALTING — critical file corrupted: {os.path.basename(failed_path)}"
+                f"HALTING — critical file corrupted: "
+                f"{os.path.basename(failed_path)}"
             )
-        print("Bot cannot start safely. Fix or delete the corrupted file and restart.")
+        print(
+            "Bot cannot start safely. Fix or delete the "
+            "corrupted file and restart."
+        )
         return False
 
     print("  ✅  All systems validated. Bot starting...\n")
@@ -102,108 +114,66 @@ def run_validation() -> bool:
 
 
 if __name__ == "__main__":
-    test_root = _resolve("test_validator_tmp")
-    original_critical = list(CRITICAL_FILES)
-    original_non_critical = list(NON_CRITICAL_FILES)
+    import shutil
+
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    tmp_dir = os.path.join(base, "test_validator_tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
 
     CRITICAL_FILES = [
-        "test_validator_tmp/critical_1.json",
-        "test_validator_tmp/critical_2.json",
-        "test_validator_tmp/critical_3.json",
+        ("test_validator_tmp/critical_a.json", None),
+        ("test_validator_tmp/critical_b.json", None),
     ]
     NON_CRITICAL_FILES = [
-        ("test_validator_tmp/non_critical_1.json", []),
-        ("test_validator_tmp/non_critical_2.json", {}),
-        ("test_validator_tmp/non_critical_3.json", []),
+        ("test_validator_tmp/noncritical_a.json", []),
+        ("test_validator_tmp/noncritical_b.json", {}),
     ]
 
-    def _write_raw(path: str, text: str) -> None:
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(text)
+    def _write(rel, data):
+        abs_path = _resolve(rel)
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        with open(abs_path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
 
-    def _safe_remove(path: str) -> None:
-        try:
-            if os.path.exists(path):
-                os.remove(path)
-        except Exception:
-            pass
-
-    def _setup_healthy_state() -> None:
-        all_files = []
-        all_files.extend((_resolve(p), {"status": "critical_ok"}) for p in CRITICAL_FILES)
-        all_files.extend((_resolve(p), d) for p, d in NON_CRITICAL_FILES)
-        for path, payload in all_files:
-            write_json(path, payload)
+    def _corrupt(rel):
+        with open(_resolve(rel), "w", encoding="utf-8") as f:
+            f.write("NOT VALID JSON {{{{")
 
     try:
-        if os.path.exists(test_root):
-            for root, dirs, files in os.walk(test_root, topdown=False):
-                for name in files:
-                    _safe_remove(os.path.join(root, name))
-                for name in dirs:
-                    try:
-                        os.rmdir(os.path.join(root, name))
-                    except Exception:
-                        pass
-        os.makedirs(test_root, exist_ok=True)
-
-        # Test 1 — All files healthy
-        _setup_healthy_state()
+        for p, d in CRITICAL_FILES:
+            _write(p, {"ok": True})
+        for p, d in NON_CRITICAL_FILES:
+            _write(p, d)
         assert run_validation() is True
         print("Test 1 PASSED")
 
-        # Test 2 — Non-critical file corrupted, no backup
-        _setup_healthy_state()
-        non_critical_path = _resolve(NON_CRITICAL_FILES[0][0])
-        _write_raw(non_critical_path, "NOT JSON {{{")
-        _safe_remove(non_critical_path + ".backup")
+        _corrupt("test_validator_tmp/noncritical_a.json")
+        try:
+            os.remove(_resolve("test_validator_tmp/noncritical_a.json") + ".backup")
+        except FileNotFoundError:
+            pass
         assert run_validation() is True
         print("Test 2 PASSED")
 
-        # Test 3 — Non-critical file corrupted, backup exists
-        _setup_healthy_state()
-        non_critical_path = _resolve(NON_CRITICAL_FILES[1][0])
-        _write_raw(non_critical_path, "NOT JSON {{{")
-        write_json(non_critical_path + ".backup", {"restored": True})
+        _corrupt("test_validator_tmp/noncritical_b.json")
+        _write("test_validator_tmp/noncritical_b.json.backup", {"restored": True})
         assert run_validation() is True
-        restored = read_json(non_critical_path)
-        assert restored == {"restored": True}
+        assert read_json(_resolve("test_validator_tmp/noncritical_b.json")) == {"restored": True}
         print("Test 3 PASSED")
 
-        # Test 4 — Critical file corrupted, no backup
-        _setup_healthy_state()
-        critical_path = _resolve(CRITICAL_FILES[0])
-        _write_raw(critical_path, "NOT JSON {{{")
-        _safe_remove(critical_path + ".backup")
+        _corrupt("test_validator_tmp/critical_a.json")
+        try:
+            os.remove(_resolve("test_validator_tmp/critical_a.json") + ".backup")
+        except FileNotFoundError:
+            pass
         assert run_validation() is False
         print("Test 4 PASSED — halt triggered correctly")
 
-        # Test 5 — Critical file corrupted, backup exists
-        _setup_healthy_state()
-        critical_path = _resolve(CRITICAL_FILES[1])
-        _write_raw(critical_path, "NOT JSON {{{")
-        write_json(critical_path + ".backup", {"critical_restored": 1})
+        _corrupt("test_validator_tmp/critical_a.json")
+        _write("test_validator_tmp/critical_a.json.backup", {"restored": True})
         assert run_validation() is True
         print("Test 5 PASSED — critical file restored")
-
     finally:
-        CRITICAL_FILES = original_critical
-        NON_CRITICAL_FILES = original_non_critical
-        if os.path.exists(test_root):
-            for root, dirs, files in os.walk(test_root, topdown=False):
-                for name in files:
-                    _safe_remove(os.path.join(root, name))
-                for name in dirs:
-                    try:
-                        os.rmdir(os.path.join(root, name))
-                    except Exception:
-                        pass
-            try:
-                os.rmdir(test_root)
-            except Exception:
-                pass
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
     print("All validator tests passed.")

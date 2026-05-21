@@ -44,6 +44,9 @@ sys.path.append(os.path.join(current_dir, "Python Files"))
 sys.path.append(os.path.join(current_dir, "Strategy"))
 sys.path.append(os.path.join(current_dir, "Memory"))
 sys.path.append(os.path.join(current_dir, "Integration"))
+_stability_dir = os.path.join(current_dir, "Stability")
+if _stability_dir not in sys.path:
+    sys.path.insert(0, _stability_dir)
 
 import data_extractor
 import risk_manager

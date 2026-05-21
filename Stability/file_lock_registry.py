@@ -1,8 +1,16 @@
+"""
+Central JSON file lock registry.
+
+All shared JSON reads and writes should pass through this module so every
+file has one process-local re-entrant lock and atomic write/backup behavior.
+"""
+
 import os
 import json
 import threading
 import shutil
 from pathlib import Path
+
 
 _registry = {}
 _registry_lock = threading.Lock()
@@ -19,123 +27,115 @@ def _get_lock(path: str) -> threading.RLock:
         return threading.RLock()
 
 
-def read_json(path: str):
-    normalized_path = os.path.abspath(path)
-    lock = _get_lock(normalized_path)
-    with lock:
+def read_json(path: str) -> dict | list | None:
+    path = os.path.abspath(path)
+    lock = _get_lock(path)
+    lock.acquire()
+    try:
         try:
-            with open(normalized_path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except Exception as error:
-            print(f"[FileRegistry] WARNING: Failed to read {normalized_path} — {error}")
-            backup_path = normalized_path + ".backup"
+        except (FileNotFoundError, json.JSONDecodeError) as error:
+            print(f"[FileRegistry] WARNING: Failed to read {path} — {error}")
+            backup_path = path + ".backup"
             if os.path.exists(backup_path):
                 try:
-                    with open(backup_path, "r", encoding="utf-8") as backup_file:
-                        backup_data = json.load(backup_file)
-                    print(f"[FileRegistry] Restored {normalized_path} from .backup")
-                    return backup_data
+                    with open(backup_path, "r", encoding="utf-8") as f:
+                        backup_content = json.load(f)
+                    print(f"[FileRegistry] Restored {path} from .backup")
+                    return backup_content
                 except Exception:
-                    print(
-                        f"[FileRegistry] CRITICAL: Backup also corrupted for {normalized_path}"
-                    )
+                    print(f"[FileRegistry] CRITICAL: Backup also corrupted for {path}")
                     return None
             return None
+        except Exception as error:
+            print(f"[FileRegistry] WARNING: Failed to read {path} — {error}")
+            return None
+    finally:
+        lock.release()
 
 
-def write_json(path: str, data):
-    normalized_path = os.path.abspath(path)
-    lock = _get_lock(normalized_path)
-    tmp_path = normalized_path + ".tmp"
-    with lock:
+def write_json(path: str, data: dict | list) -> bool:
+    path = os.path.abspath(path)
+    lock = _get_lock(path)
+    tmp_path = path + ".tmp"
+    lock.acquire()
+    try:
         try:
-            parent = os.path.dirname(normalized_path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-
+            os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
                 f.flush()
                 os.fsync(f.fileno())
-
-            os.replace(tmp_path, normalized_path)
-            shutil.copy2(normalized_path, normalized_path + ".backup")
+            os.replace(tmp_path, path)
+            shutil.copy2(path, path + ".backup")
             return True
         except Exception as error:
-            print(f"[FileRegistry] ERROR: Failed to write {normalized_path} — {error}")
-            try:
-                if os.path.exists(tmp_path):
+            print(f"[FileRegistry] ERROR: Failed to write {path} — {error}")
+            if os.path.exists(tmp_path):
+                try:
                     os.remove(tmp_path)
-            except Exception:
-                pass
+                except Exception:
+                    pass
             return False
+    finally:
+        lock.release()
 
 
 def register(path: str) -> None:
-    normalized_path = os.path.abspath(path)
-    _get_lock(normalized_path)
-    print(f"[FileRegistry] Registered: {normalized_path}")
+    path = os.path.abspath(path)
+    _get_lock(path)
+    print(f"[FileRegistry] Registered: {path}")
 
 
 def get_registry_status() -> dict:
     with _registry_lock:
-        paths = list(_registry.keys())
-    return {"registered_files": len(paths), "paths": paths}
+        return {
+            "registered_files": len(_registry),
+            "paths": list(_registry.keys()),
+        }
 
 
-try:
-    print("[FileRegistry] ✓ Initialised — central file lock registry ready.")
-except UnicodeEncodeError:
-    print("[FileRegistry] Initialised - central file lock registry ready.")
+print("[FileRegistry] ✓ Initialised — central file lock registry ready.")
 
 
 if __name__ == "__main__":
-    test_files = [
-        Path("test_output.json"),
-        Path("test_output.json.backup"),
-        Path("test_output.json.tmp"),
-        Path("test_thread.json"),
-        Path("test_thread.json.backup"),
-        Path("test_thread.json.tmp"),
-    ]
+    write_json("test_output.json", {"hello": "world", "count": 42})
+    result = read_json("test_output.json")
+    assert result == {"hello": "world", "count": 42}
+    print("Test 1 PASSED")
 
-    try:
-        # Test 1 — Basic write and read
-        assert write_json("test_output.json", {"hello": "world", "count": 42}) is True
-        result = read_json("test_output.json")
-        assert result == {"hello": "world", "count": 42}
-        print("Test 1 PASSED")
+    write_json("test_output.json", {"hello": "world"})
+    with open("test_output.json", "w", encoding="utf-8") as f:
+        f.write("NOT VALID JSON {{{{")
+    result = read_json("test_output.json")
+    assert result == {"hello": "world"}
+    print("Test 2 PASSED — backup restore works")
 
-        # Test 2 — Backup restore
-        assert write_json("test_output.json", {"hello": "world"}) is True
-        with open("test_output.json", "w", encoding="utf-8") as f:
-            f.write("NOT VALID JSON {{{{")
-        result = read_json("test_output.json")
-        assert result == {"hello": "world"}
-        print("Test 2 PASSED — backup restore works")
+    results = []
 
-        # Test 3 — Thread safety
-        results = []
+    def worker(i):
+        write_json("test_thread.json", {"writer": i})
+        val = read_json("test_thread.json")
+        results.append(val)
 
-        def worker(i):
-            write_json("test_thread.json", {"writer": i})
-            val = read_json("test_thread.json")
-            results.append(val)
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert all(r is not None for r in results)
+    print("Test 3 PASSED — no thread corruption")
 
-        threads = [threading.Thread(target=worker, args=(i,)) for i in range(10)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-
-        assert all(r is not None for r in results)
-        print("Test 3 PASSED — no thread corruption")
-    finally:
-        for file_path in test_files:
-            try:
-                if file_path.exists():
-                    file_path.unlink()
-            except Exception:
-                pass
+    for test_file in [
+        "test_output.json",
+        "test_output.json.backup",
+        "test_thread.json",
+        "test_thread.json.backup",
+    ]:
+        try:
+            Path(test_file).unlink()
+        except FileNotFoundError:
+            pass
 
     print("All tests passed.")

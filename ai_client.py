@@ -23,10 +23,16 @@ For files that need the model name only:
 """
 
 import os
+import sys
 import time
 import threading
 import concurrent.futures
 from dotenv import load_dotenv
+
+_STABILITY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Stability")
+if _STABILITY_DIR not in sys.path:
+    sys.path.insert(0, _STABILITY_DIR)
+
 from console_display import (
     print_critical,
     print_outage_banner,
