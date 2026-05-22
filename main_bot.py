@@ -986,6 +986,12 @@ def run_trading_cycle(high_precautions=False):
     # Resets the moment any regime change, conf drop, or non-WAIT fires.
     _cw_regime = regime_result.get("regime", "UNKNOWN")
     _cw_conf   = regime_result.get("confidence") or 0.0
+    
+    # FIX: Implement missing reset conditions! If regime changes or confidence drops, reset the wait tracker.
+    if _cw_regime != _last_wait_regime or _cw_conf < 0.65:
+        _consecutive_waits = 0
+        _last_wait_regime = None
+        
     if (_consecutive_waits >= GATE_MAX_CONSECUTIVE_WAITS
             and _cw_regime == _last_wait_regime
             and _cw_conf >= 0.65):

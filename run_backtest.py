@@ -112,23 +112,29 @@ def preflight_check(skip_download):
             print("  ❌ CLAUDE_API_KEY_1 not set — add to .env file")
             ok = False
 
-    # ── Required scripts ───────────────────────────────────────────
-    # Verify keys are actually readable
+    # ── Required keys (support Claude or Gemini dynamically) ────────
     from dotenv import load_dotenv
     load_dotenv()
-    _k1 = os.getenv('CLAUDE_API_KEY_1', '')
-    _k2 = os.getenv('CLAUDE_API_KEY_2', '')
-    _k3 = os.getenv('CLAUDE_API_KEY_3', '')
-    _keys_found = sum(1 for k in [_k1, _k2, _k3] if k.strip())
-    if _keys_found == 0:
-        print("[Backtest] ❌ CRITICAL: No Claude API keys "
-              "found in .env — all AI calls will fail.")
-        print("           Set CLAUDE_API_KEY_1 in .env "
-              "and restart.")
-        sys.exit(1)
+    
+    from ai_client import USE_GEMINI, GEMINI_API_KEY
+    
+    if USE_GEMINI:
+        if not GEMINI_API_KEY.strip():
+            print("[Backtest] ❌ CRITICAL: USE_GEMINI is active but GEMINI_API_KEY is not set in .env.")
+            sys.exit(1)
+        else:
+            print("[Backtest] ✓ Active Gemini API key found in .env")
     else:
-        print(f"[Backtest] ✓ {_keys_found} API key(s) "
-              f"found in .env")
+        _k1 = os.getenv('CLAUDE_API_KEY_1', '')
+        _k2 = os.getenv('CLAUDE_API_KEY_2', '')
+        _k3 = os.getenv('CLAUDE_API_KEY_3', '')
+        _keys_found = sum(1 for k in [_k1, _k2, _k3] if k.strip())
+        if _keys_found == 0:
+            print("[Backtest] ❌ CRITICAL: No Claude API keys found in .env — all AI calls will fail.")
+            print("           Set CLAUDE_API_KEY_1 in .env and restart.")
+            sys.exit(1)
+        else:
+            print(f"[Backtest] ✓ {_keys_found} API key(s) found in .env")
 
     for path, label in [
         (DOWNLOADER, 'data_downloader.py'),
@@ -283,13 +289,14 @@ def main():
     # In backtest mode it must always start fresh so
     # every valid signal gets a Claude evaluation.
     try:
-        from ai_client import _cb_lock
+        from ai_client import _cb_lock, set_backtest_mode
         import ai_client as _ac
         with _cb_lock:
             _ac._cb_tripped           = False
             _ac._cb_consecutive_fails = 0
             _ac._cb_tripped_at        = 0.0
-        print("[Backtest] Circuit breaker reset — clean AI state.")
+        set_backtest_mode(True)
+        print("[Backtest] Circuit breaker reset — clean AI state, backtest mode enabled.")
     except Exception as _cb_e:
         print(f"[Backtest] Could not reset circuit breaker: {_cb_e}")
 

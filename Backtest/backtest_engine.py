@@ -148,7 +148,18 @@ except ImportError:
 # load_dotenv() called at the top of the file to fix import-order validation bug
 # Signal to risk_manager that this is a backtest run — suppresses per-candle
 # "Risk cleared" prints and skips MT5 calls (which hit every active candle).
-os.environ["BACKTEST_MODE"] = "1"
+# Only use mock if no real AI key is available
+import os
+_has_gemini = bool(os.getenv("GEMINI_API_KEY", "").strip())
+_has_claude = any(
+    os.getenv(f"CLAUDE_API_KEY_{i}", "").strip()
+    for i in range(1, 4)
+)
+if not _has_gemini and not _has_claude:
+    os.environ["BACKTEST_MODE"] = "1"
+    print("[Backtest] No AI keys found — running in mock mode.")
+else:
+    print("[Backtest] AI key found — running with real AI decisions.")
 
 # D-01 FIX: GEMINI_API_KEY removed — backtest now uses the same Anthropic
 # keys as the live bot, loaded automatically by ai_client.py from .env
@@ -484,13 +495,20 @@ def should_call_ai(regime_result, session):
     if regime == "LOW_VOL_RANGE" and confidence < 0.25:   # FIX Bug 3: was "RANGING" — gate never fired
         return False, "ranging_low_conf"
 
-    from master_controls import GATE_MIN_CONFIDENCE
+    from master_controls import GATE_MIN_CONFIDENCE, GATE_MAX_CONSECUTIVE_WAITS
     conf = regime_result.get("confidence") or 0
+    
+    # FIX: Implement missing reset conditions! If regime changes or confidence drops, reset the wait tracker.
+    global _consecutive_waits, _last_wait_regime
+    if regime != _last_wait_regime or confidence < 0.65:
+        _consecutive_waits = 0
+        _last_wait_regime = None
+
     if conf < GATE_MIN_CONFIDENCE:
         return False, "confidence_gate"
 
     # Gate 2: AI already said WAIT repeatedly in exact same regime state
-    if (_consecutive_waits >= 3
+    if (_consecutive_waits >= GATE_MAX_CONSECUTIVE_WAITS
             and regime == _last_wait_regime
             and confidence >= 0.65):
         return False, "consecutive_wait"

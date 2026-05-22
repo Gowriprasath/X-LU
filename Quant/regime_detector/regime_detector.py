@@ -271,8 +271,12 @@ def predict(h1_df, m5_df=None, h4_df=None, d1_df=None):
         
         features_raw = features.copy()
         
+        # O(N^2) FIX: Only calculate the rolling metric on the trailing window, not the whole history
+        window = 500
+        sliced_features = features.iloc[-window:] if len(features) >= window else features
+        
         tf_cols = [c for c in TF_FEATURE_COLS if c in features.columns]
-        features_z = apply_rolling_zscore(features, cols=tf_cols, window=500)
+        features_z = apply_rolling_zscore(sliced_features, cols=tf_cols, window=window)
         features_z = features_z.fillna(0.0)
 
         latest_raw = features_raw.iloc[[-1]]

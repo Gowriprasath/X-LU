@@ -203,6 +203,7 @@ def close_episode(ticket, result, final_pnl_dollars=0.0):
         # If final_pnl = +$50 → pnl_r = +2.0R (correct 2R win)
         # The * 100 is the oz-per-lot multiplier — NOT a pip convention assumption.
         lot_size = ep.get('lot_size', 1) or 1
+        sl_dist = ep.get('sl_dist', 1.0)
         dollar_risk = sl_dist * lot_size * 100   # XAUUSD: 100 oz per standard lot
         pnl_r = round(final_pnl_dollars / dollar_risk, 4) if dollar_risk > 0 else 0
 

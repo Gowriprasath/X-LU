@@ -45,10 +45,18 @@ from telegram_notifier import (
 
 load_dotenv()
 
-# -- Re-export these so every file can do: from ai_client import AI_MODEL --
-AI_PROVIDER = "CLAUDE"
-AI_MODEL = "claude-sonnet-4-6"
-AI_DISPLAY_NAME = "Claude"
+# -- Provider Configuration --
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+USE_GEMINI = os.getenv("USE_GEMINI", "False").strip().lower() == "true"
+
+if USE_GEMINI:
+    AI_PROVIDER = "GEMINI"
+    AI_MODEL = "gemini-3.5-flash"
+    AI_DISPLAY_NAME = "Gemini"
+else:
+    AI_PROVIDER = "CLAUDE"
+    AI_MODEL = "claude-sonnet-4-6"
+    AI_DISPLAY_NAME = "Claude"
 
 __all__ = ["call_ai", "AI_MODEL", "AI_DISPLAY_NAME", "AI_PROVIDER"]
 
@@ -69,7 +77,7 @@ _RETRY_SLEEP = 2.0            # seconds between retries on rate-limit
 # B-10 FIX: cache one Anthropic client per key index instead of creating a new
 # connection pool on every call. Over 288 calls/day this prevents port exhaustion
 # and TLS handshake overhead. Clients are created lazily and reused.
-_client_pool: dict = {}       # {key_index: anthropic.Anthropic}
+_client_pool: dict = {}       # {key_index: client}
 
 # -- Circuit Breaker State ------------------------------------------------
 _cb_lock = threading.Lock()
@@ -80,7 +88,7 @@ _CB_FAIL_THRESHOLD: int = 3      # trips after N fails
 _CB_COOLDOWN_SECONDS: float = 900.0  # 15 minutes
 
 # -- Call Timeout ---------------------------------------------------------
-_CALL_TIMEOUT_SECONDS: float = 30.0
+_CALL_TIMEOUT_SECONDS: float = 150.0
 
 
 def _load_keys() -> list:
@@ -89,6 +97,11 @@ def _load_keys() -> list:
     Falls back to single CLAUDE_API_KEY if the numbered ones aren't set.
     Always returns a non-empty list (raises if truly nothing configured).
     """
+    if USE_GEMINI:
+        if not GEMINI_API_KEY:
+            raise EnvironmentError("[ai_client] GEMINI_API_KEY is empty in .env.")
+        return [GEMINI_API_KEY]
+
     keys = []
     for i in range(1, 4):
         k = os.getenv(f"CLAUDE_API_KEY_{i}", "").strip()
@@ -149,6 +162,18 @@ def _is_rate_limit_error(exc) -> bool:
 # UNIFIED CALL WITH 3-KEY ROTATION
 # ================================================================
 
+_backtest_mode: bool = False
+
+def is_backtest_mode() -> bool:
+    global _backtest_mode
+    return _backtest_mode or os.environ.get("BACKTEST_MODE") == "1"
+
+def set_backtest_mode(enabled: bool) -> None:
+    global _backtest_mode
+    _backtest_mode = enabled
+    if enabled:
+        print("[ai_client] Backtest mode — circuit breaker cooldown: 30s")
+
 def is_ai_available() -> bool:
     global _cb_tripped, _cb_consecutive_fails
     with _cb_lock:
@@ -157,7 +182,8 @@ def is_ai_available() -> bool:
 
         # Check if cooldown has expired
         elapsed = time.time() - _cb_tripped_at
-        if elapsed >= _CB_COOLDOWN_SECONDS:
+        active_cooldown = 30.0 if is_backtest_mode() else _CB_COOLDOWN_SECONDS
+        if elapsed >= active_cooldown:
             # Auto-reset the circuit breaker
             _cb_tripped = False
             _cb_consecutive_fails = 0
@@ -166,7 +192,7 @@ def is_ai_available() -> bool:
             print_recovery_banner()
             return True
 
-        remaining = _CB_COOLDOWN_SECONDS - elapsed
+        remaining = active_cooldown - elapsed
         print(f"[ai_client] Circuit breaker active. Resuming in {remaining:.0f}s")
         return False
 
@@ -187,10 +213,106 @@ def get_ai_status() -> dict:
         }
 
 
+def _generate_mock_decision(prompt: str) -> str:
+    import re
+    import json
+    import hashlib
+
+    # Default values
+    current_price = 1800.0
+    session = "London"
+    regime = "LOW_VOL_RANGE"
+    time_str = "unknown"
+
+    # Parse current price
+    price_match = re.search(r"Current Price\s*:\s*([\d.]+)", prompt, re.IGNORECASE)
+    if price_match:
+        current_price = float(price_match.group(1))
+
+    # Parse session
+    session_match = re.search(r"Current session\s*:\s*(\w+)", prompt, re.IGNORECASE)
+    if session_match:
+        session = session_match.group(1)
+
+    # Parse simulated time
+    time_match = re.search(r"Simulated Time\s*:\s*([\d-]+) ([\d:]+)", prompt, re.IGNORECASE)
+    if time_match:
+        time_str = f"{time_match.group(1)} {time_match.group(2)}"
+    else:
+        # Fallback to a hash of the prompt itself to be deterministic
+        time_str = str(len(prompt))
+
+    # Detect regime
+    # Look for the regime name in the prompt
+    for r in ["BULL_TREND", "BEAR_TREND", "LOW_VOL_RANGE", "COMPRESSION", "REVERSAL"]:
+        if r in prompt:
+            regime = r
+            break
+
+    # Generate a deterministic hash for decision making
+    h = int(hashlib.md5(time_str.encode('utf-8')).hexdigest(), 16)
+    
+    # We want ~4.5% frequency of trades overall to be realistic and give plenty of samples
+    is_trade_candle = (h % 22 == 0)
+
+    decision = {
+        "signal": "WAIT",
+        "confluence_score": 1,
+        "rationale": "Default mock wait state."
+    }
+
+    if is_trade_candle:
+        if regime == "BULL_TREND":
+            decision = {
+                "signal": "BUY",
+                "confluence_score": 3,
+                "entry": current_price,
+                "sl": current_price - 8.0,
+                "tp": current_price + 16.0,
+                "rationale": f"Deterministic mock buy in BULL_TREND regime during {session} session."
+            }
+        elif regime == "BEAR_TREND":
+            decision = {
+                "signal": "SELL",
+                "confluence_score": 3,
+                "entry": current_price,
+                "sl": current_price + 8.0,
+                "tp": current_price - 16.0,
+                "rationale": f"Deterministic mock sell in BEAR_TREND regime during {session} session."
+            }
+        elif regime == "REVERSAL":
+            # REVERSAL can signal BUY or SELL depending on the hash parity
+            if h % 2 == 0:
+                decision = {
+                    "signal": "BUY",
+                    "confluence_score": 3,
+                    "entry": current_price,
+                    "sl": current_price - 6.0,
+                    "tp": current_price + 12.0,
+                    "rationale": f"Deterministic mock reversal buy in {session} session."
+                }
+            else:
+                decision = {
+                    "signal": "SELL",
+                    "confluence_score": 3,
+                    "entry": current_price,
+                    "sl": current_price + 6.0,
+                    "tp": current_price - 12.0,
+                    "rationale": f"Deterministic mock reversal sell in {session} session."
+                }
+
+    # Wrap the decision dictionary as a JSON block
+    return json.dumps(decision, indent=2)
+
+
 def call_ai(prompt: str, max_tokens: int = 2048) -> str | None:
+    if is_backtest_mode():
+        return _generate_mock_decision(prompt)
+
     """
-    Makes a single-turn Claude call. Auto-rotates across 3 API keys
+    Makes a single-turn Claude or Gemini call. Auto-rotates across API keys
     on rate-limit or overloaded errors. Returns plain string or None.
+
 
     Args:
         prompt:     Full prompt text.
@@ -205,6 +327,85 @@ def call_ai(prompt: str, max_tokens: int = 2048) -> str | None:
     if not is_ai_available():
         print_outage_banner()
         return None
+
+    if USE_GEMINI:
+        try:
+            from google import genai
+            from google.genai import types
+            with _key_lock:
+                if "gemini" not in _client_pool:
+                    _client_pool["gemini"] = genai.Client(
+                        api_key=GEMINI_API_KEY,
+                        http_options=types.HttpOptions(timeout=150000)
+                    )
+                client = _client_pool["gemini"]
+
+            def _do_call(model_name):
+                return client.models.generate_content(
+                    model=model_name,
+                    contents=prompt
+                )
+
+            # Try primary model first (AI_MODEL, which is gemini-3.5-flash)
+            success = False
+            response = None
+            last_err = None
+
+            # Set max_workers=2 so that the fallback call is never blocked in queue by a slow/hanging primary call
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                # 1. Primary call
+                future = executor.submit(_do_call, AI_MODEL)
+                try:
+                    response = future.result(timeout=_CALL_TIMEOUT_SECONDS)
+                    success = True
+                except concurrent.futures.TimeoutError:
+                    print(f"[ai_client] ⚠ Gemini primary ({AI_MODEL}) timed out after {_CALL_TIMEOUT_SECONDS}s.")
+                    last_err = "TimeoutError"
+                except Exception as exc:
+                    print(f"[ai_client] ⚠ Gemini primary ({AI_MODEL}) call failed: {type(exc).__name__}: {exc}")
+                    last_err = exc
+
+                # 2. Fallback if primary failed
+                if not success:
+                    fallback_model = "gemini-2.5-flash"
+                    print(f"[ai_client] 🔄 Attempting automatic fallback to {fallback_model}...")
+                    future_fallback = executor.submit(_do_call, fallback_model)
+                    try:
+                        response = future_fallback.result(timeout=_CALL_TIMEOUT_SECONDS)
+                        success = True
+                        print(f"[ai_client] ✓ Fallback to {fallback_model} succeeded!")
+                    except concurrent.futures.TimeoutError:
+                        print(f"[ai_client] ✗ Gemini fallback ({fallback_model}) also timed out.")
+                        last_err = "TimeoutError (fallback)"
+                    except Exception as exc:
+                        print(f"[ai_client] ✗ Gemini fallback ({fallback_model}) failed: {type(exc).__name__}: {exc}")
+                        last_err = exc
+
+            if not success:
+                # Both primary and fallback failed
+                with _cb_lock:
+                    _cb_consecutive_fails += 1
+                    if (_cb_consecutive_fails >= _CB_FAIL_THRESHOLD and not _cb_tripped):
+                        _cb_tripped = True
+                        _cb_tripped_at = time.time()
+                        print(f"[ai_client] 🔴 Circuit breaker TRIPPED after {_cb_consecutive_fails} consecutive failures. AI paused.")
+                return None
+
+            with _cb_lock:
+                if _cb_consecutive_fails > 0 or _cb_tripped:
+                    was_tripped = _cb_tripped
+                    _cb_consecutive_fails = 0
+                    _cb_tripped = False
+                    if was_tripped:
+                        print("[ai_client] ✓ AI recovered after outage.")
+                        send_recovery_alert()
+                        print_recovery_banner()
+
+            return response.text.strip()
+
+        except Exception as outer_exc:
+            print(f"[ai_client] ✗ Gemini block execution error: {type(outer_exc).__name__}: {outer_exc}")
+            return None
 
     try:
         import anthropic

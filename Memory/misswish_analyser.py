@@ -111,8 +111,10 @@ def _fetch_day_candles(date_str: str,
 
     # ── BACKTEST PATH — use pre-loaded DataFrames ────────────────────
     if m5_df is not None and h1_df is not None:
-        day_m5 = m5_df[(m5_df.index >= start_dt) & (m5_df.index < end_dt)]
-        day_h1 = h1_df[(h1_df.index >= start_dt) & (h1_df.index < end_dt)]
+        s_dt = NY_TZ.localize(start_dt) if start_dt.tzinfo is None else start_dt
+        e_dt = NY_TZ.localize(end_dt) if end_dt.tzinfo is None else end_dt
+        day_m5 = m5_df[(m5_df.index >= s_dt) & (m5_df.index < e_dt)]
+        day_h1 = h1_df[(h1_df.index >= s_dt) & (h1_df.index < e_dt)]
         if day_m5.empty:
             print(f"[MissWish] No M5 data in DataFrame for {date_str}.")
             return None
