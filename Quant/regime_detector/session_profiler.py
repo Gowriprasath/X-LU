@@ -521,9 +521,16 @@ def enrich_regime_result(
     regime_profiles = profiles.get(regime, {})
     session_prof    = regime_profiles.get(session) or regime_profiles.get("ALL", {})
 
-    # Use profile mean if available, else persistence mean
-    profile_mean = float(session_prof.get("mean_candles", dur_mean_candles))
-    use_mean     = profile_mean if profile_mean > 0 else dur_mean_candles
+    # Use profile mean if available and non-zero.
+    # When sample_size==0 the key EXISTS with value 0 — must fall through
+    # to the ALL-session aggregate, then to the persistence mean.
+    # session_prof.get("mean_candles", fallback) returns 0, NOT fallback,
+    # because the key is present. We must check the value explicitly.
+    profile_mean = float(session_prof.get("mean_candles", 0))
+    if profile_mean <= 0:
+        all_prof     = regime_profiles.get("ALL", {})
+        profile_mean = float(all_prof.get("mean_candles", 0))
+    use_mean = profile_mean if profile_mean > 0 else dur_mean_candles
 
     # Compute derived timing values
     age_status    = _classify_age(elapsed_candles, use_mean)

@@ -421,6 +421,51 @@ def _record_episode_candle(mgmt_result):
 # OVERNIGHT REGIME GUARD
 # Protects open trade during dead zones — zero API cost
 # ================================================================
+def _notify_force_close(active_trade: dict, session_fn):
+    """
+    Fetches the closing deal from MT5 history, computes PnL and pips,
+    then fires print_trade_close() and send_trade_closed().
+    Extracted to avoid copy-paste between run_trading_cycle() and
+    run_overnight_trade_guard(). Non-fatal — never raises.
+    """
+    try:
+        import MetaTrader5 as _mt5_fc
+        _fc_close_price = 0.0
+        _fc_pnl_dollars = 0.0
+        _fc_pnl_pips    = 0.0
+        _fc_ticket      = active_trade.get("ticket", 0)
+
+        if _fc_ticket and _mt5_fc.initialize():
+            try:
+                _fc_deals = _mt5_fc.history_deals_get(position=_fc_ticket)
+                if _fc_deals and len(_fc_deals) > 0:
+                    _last_deal      = _fc_deals[-1]
+                    _fc_close_price = _last_deal.price
+                    _fc_pnl_dollars = _last_deal.profit
+                    _fc_entry       = active_trade.get("entry", 0)
+                    _fc_direction   = active_trade.get("type", "")
+                    if _fc_entry and _fc_close_price:
+                        if _fc_direction == "BUY":
+                            _fc_pnl_pips = (_fc_close_price - _fc_entry) * 10.0
+                        elif _fc_direction == "SELL":
+                            _fc_pnl_pips = (_fc_entry - _fc_close_price) * 10.0
+            finally:
+                _mt5_fc.shutdown()
+
+        _fc_trade_dict = {
+            "direction":  active_trade.get("type",   "N/A"),
+            "entry":      active_trade.get("entry",  0),
+            "exit_price": _fc_close_price,
+            "lot":        active_trade.get("lot",    0),
+            "session":    session_fn() or "N/A",
+            "ticket":     _fc_ticket,
+        }
+        print_trade_close(_fc_trade_dict, _fc_pnl_dollars, _fc_pnl_pips)
+        send_trade_closed(_fc_trade_dict, _fc_pnl_dollars, _fc_pnl_pips)
+    except Exception:
+        pass
+
+
 def run_overnight_trade_guard():
     global _active_trade
     if not _active_trade["ticket"]:
@@ -461,52 +506,7 @@ def run_overnight_trade_guard():
     # REVERSAL hardcoded close already executed inside manage_trade — clean up here
     if mgmt_result.get("force_close"):
         # ── Notify: Force Close ──────────────────────────
-        try:
-            import MetaTrader5 as _mt5_fc
-            _fc_close_price = 0.0
-            _fc_pnl_dollars = 0.0
-            _fc_pnl_pips    = 0.0
-            _fc_ticket      = _active_trade.get("ticket", 0)
-            
-            if _fc_ticket and _mt5_fc.initialize():
-                _fc_deals = _mt5_fc.history_deals_get(
-                    position=_fc_ticket
-                )
-                if _fc_deals and len(_fc_deals) > 0:
-                    # Last deal is the closing deal
-                    _last_deal       = _fc_deals[-1]
-                    _fc_close_price  = _last_deal.price
-                    _fc_pnl_dollars  = _last_deal.profit
-                    _fc_entry        = _active_trade.get("entry", 0)
-                    _fc_direction    = _active_trade.get("type", "")
-                    if _fc_entry and _fc_close_price:
-                        if _fc_direction == "BUY":
-                            _fc_pnl_pips = (
-                              (_fc_close_price - _fc_entry) * 10.0
-                            )
-                        elif _fc_direction == "SELL":
-                            _fc_pnl_pips = (
-                              (_fc_entry - _fc_close_price) * 10.0
-                            )
-                _mt5_fc.shutdown()
-            
-            _fc_trade_dict = {
-                "direction"  : _active_trade.get("type",   "N/A"),
-                "entry"      : _active_trade.get("entry",  0),
-                "exit_price" : _fc_close_price,
-                "lot"        : _active_trade.get("lot",    0),
-                "session"    : get_current_session() or "N/A",
-                "ticket"     : _fc_ticket,
-            }
-            
-            print_trade_close(_fc_trade_dict, 
-                              _fc_pnl_dollars, 
-                              _fc_pnl_pips)
-            send_trade_closed(_fc_trade_dict, 
-                              _fc_pnl_dollars, 
-                              _fc_pnl_pips)
-        except Exception:
-            pass   # never let notification crash trade mgmt
+        _notify_force_close(_active_trade, get_current_session)
         memory_manager.update_final_review(
             _active_trade["ticket"], "CLOSED_BY_AI",
             f"Overnight guard hybrid REVERSAL close. {mgmt_result['action_taken']}"
@@ -880,52 +880,7 @@ def run_trading_cycle(high_precautions=False):
         # We still need to update memory + reset _active_trade here.
         if mgmt_result.get("force_close"):
             # ── Notify: Force Close ──────────────────────────
-            try:
-                import MetaTrader5 as _mt5_fc
-                _fc_close_price = 0.0
-                _fc_pnl_dollars = 0.0
-                _fc_pnl_pips    = 0.0
-                _fc_ticket      = _active_trade.get("ticket", 0)
-                
-                if _fc_ticket and _mt5_fc.initialize():
-                    _fc_deals = _mt5_fc.history_deals_get(
-                        position=_fc_ticket
-                    )
-                    if _fc_deals and len(_fc_deals) > 0:
-                        # Last deal is the closing deal
-                        _last_deal       = _fc_deals[-1]
-                        _fc_close_price  = _last_deal.price
-                        _fc_pnl_dollars  = _last_deal.profit
-                        _fc_entry        = _active_trade.get("entry", 0)
-                        _fc_direction    = _active_trade.get("type", "")
-                        if _fc_entry and _fc_close_price:
-                            if _fc_direction == "BUY":
-                                _fc_pnl_pips = (
-                                  (_fc_close_price - _fc_entry) * 10.0
-                                )
-                            elif _fc_direction == "SELL":
-                                _fc_pnl_pips = (
-                                  (_fc_entry - _fc_close_price) * 10.0
-                                )
-                    _mt5_fc.shutdown()
-                
-                _fc_trade_dict = {
-                    "direction"  : _active_trade.get("type",   "N/A"),
-                    "entry"      : _active_trade.get("entry",  0),
-                    "exit_price" : _fc_close_price,
-                    "lot"        : _active_trade.get("lot",    0),
-                    "session"    : get_current_session() or "N/A",
-                    "ticket"     : _fc_ticket,
-                }
-                
-                print_trade_close(_fc_trade_dict, 
-                                  _fc_pnl_dollars, 
-                                  _fc_pnl_pips)
-                send_trade_closed(_fc_trade_dict, 
-                                  _fc_pnl_dollars, 
-                                  _fc_pnl_pips)
-            except Exception:
-                pass   # never let notification crash trade mgmt
+            _notify_force_close(_active_trade, get_current_session)
             memory_manager.update_final_review(
                 _active_trade["ticket"], "CLOSED_BY_AI",
                 f"Hybrid manager REVERSAL close. {mgmt_result['action_taken']}"
