@@ -35,6 +35,29 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
+# ==============================================================================
+# SECTION 0 - REGIME MODEL VARIANT
+# ==============================================================================
+# Controls which trained regime model the bot uses for trading and which variant
+# trainer.py saves new models into.
+#
+# Available variants:
+#   "MODEL_A_HMM_TIME"    - HMM trained with time+session features (default)
+#   "MODEL_B_HMM_NO_TIME" - HMM trained on price features only
+#
+# To switch: change this one line. All paths update automatically.
+# To train a new variant: set this, then run trainer.py.
+
+ACTIVE_REGIME_MODEL = "MODEL_B_HMM_NO_TIME"
+
+# Validation - must be one of the known variants
+_KNOWN_VARIANTS = ["MODEL_A_HMM_TIME", "MODEL_B_HMM_NO_TIME"]
+if ACTIVE_REGIME_MODEL not in _KNOWN_VARIANTS:
+    raise ValueError(
+        f"master_controls: ACTIVE_REGIME_MODEL '{ACTIVE_REGIME_MODEL}' "
+        f"is not a known variant. Choose from: {_KNOWN_VARIANTS}"
+    )
+
 # ══════════════════════════════════════════════════════════════════════
 # SECTION 1 — AI PROVIDER
 # ══════════════════════════════════════════════════════════════════════
@@ -94,7 +117,7 @@ META_MIN_THRESHOLD = 0.55
 # ══════════════════════════════════════════════════════════════════════
 # SECTION 5 — GATE: CONSECUTIVE WAITS
 # ══════════════════════════════════════════════════════════════════════
-GATE_MAX_CONSECUTIVE_WAITS = 24
+GATE_MAX_CONSECUTIVE_WAITS = 15
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -216,10 +239,23 @@ WISDOM_REBUILD_DAYS = 5
 # ══════════════════════════════════════════════════════════════════════
 # SECTION 22 — MEMORY CAPS
 # ══════════════════════════════════════════════════════════════════════
-MEMORY_CAP_KEYWORDS    = 5000
-MEMORY_CAP_MISSWISH_KW = 5000
-MEMORY_CAP_MISSWISH    = 10000
-MEMORY_CAP_SHADOW      = 20000
+MEMORY_CAP_KEYWORDS    = 500000
+MEMORY_CAP_MISSWISH_KW = 500000
+MEMORY_CAP_MISSWISH    = 1000000
+MEMORY_CAP_SHADOW      = 2000
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SECTION 23 — REGIME ROUTER
+# ══════════════════════════════════════════════════════════════════════
+# Controls regime_router.py behaviour.
+# These are imported by regime_router — changing here affects live bot.
+
+REGIME_ROUTER_DUAL_STRICT          = True
+REGIME_ROUTER_REVERSAL_SIZE        = 0.50
+REGIME_ROUTER_SL_MULTIPLIER_TREND  = 1.20
+REGIME_ROUTER_SL_MULTIPLIER_REVERSAL = 0.80
+REGIME_ROUTER_TP_MULTIPLIER_RANGE  = 0.80
 
 
 # ══════════════════════════════════════════════════════════════════════

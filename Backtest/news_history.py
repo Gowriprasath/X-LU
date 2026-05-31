@@ -297,6 +297,10 @@ def _ensure_loaded():
         _CALENDAR_LOADED = True
 
 
+_LAST_QUERY_DATE = None
+_LAST_QUERY_RESULT = None
+
+
 def get_news_for_date(query_date) -> list:
     """
     Returns list of event dicts for the given date.
@@ -309,9 +313,14 @@ def get_news_for_date(query_date) -> list:
     Returns:
         list of event dicts with "time" as tz-aware datetime
     """
+    global _LAST_QUERY_DATE, _LAST_QUERY_RESULT
     _ensure_loaded()
     if isinstance(query_date, datetime):
         query_date = query_date.date()
+    
+    if _LAST_QUERY_DATE == query_date:
+        return _LAST_QUERY_RESULT
+
     key = query_date.isoformat() if hasattr(query_date, "isoformat") else str(query_date)
     raw_events = _CALENDAR.get(key, [])
 
@@ -329,7 +338,11 @@ def get_news_for_date(query_date) -> list:
         except Exception:
             ev_copy["time"] = None
         result.append(ev_copy)
+    
+    _LAST_QUERY_DATE = query_date
+    _LAST_QUERY_RESULT = result
     return result
+
 
 
 def is_in_news_window(current_time: datetime, news_today: list,

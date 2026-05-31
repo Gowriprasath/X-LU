@@ -108,7 +108,8 @@ def log_trade(ticket, signal, conf_score, ict_logic, classic_logic, elliott_logi
         # BUG-14 FIX: Rolling cap — archive oldest when file exceeds 800 trades
         _MEMORY_CAP = 800
         if len(memory_data) > _MEMORY_CAP:
-            archive_count = len(memory_data) - _MEMORY_CAP
+            # Batch optimization: archive a chunk of 100 items at once rather than thrashing disk 1-by-1
+            archive_count = max(100, len(memory_data) - _MEMORY_CAP)
             to_archive    = memory_data[:archive_count]
             memory_data   = memory_data[archive_count:]
             archive_date  = datetime.now().strftime('%Y%m%d_%H%M%S')

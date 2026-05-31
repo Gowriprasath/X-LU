@@ -145,17 +145,37 @@ def _extract_new_lessons(new_trades: list, existing_lessons: dict,
     except Exception:
         pass
 
+    for k, v in list(existing_lessons.items()):
+        if not isinstance(v, dict):
+            existing_lessons[k] = {
+                'text':           str(v),
+                'corroborations': 1,
+                'violations':     0,
+                'total_trials':   1,
+                'success_rate':   1.0,
+                'added_date':     'legacy',
+                'rebuild_at_add': rebuild_count,
+            }
+        else:
+            corrobs = v.get("corroborations", v.get("confidence", 1))
+            viols   = v.get("violations", 0)
+            trials  = v.get("total_trials", corrobs + viols)
+            rate    = v.get("success_rate", 1.0 if trials == 0 else corrobs / trials)
+            v["corroborations"] = corrobs
+            v["violations"]     = viols
+            v["total_trials"]   = trials
+            v["success_rate"]   = round(rate, 4)
+            if "confidence" in v:
+                del v["confidence"]
+
     if existing_lessons:
         existing_text_parts = []
         for k, v in existing_lessons.items():
-            if isinstance(v, dict):
-                conf = v.get("confidence", 1)
-                text = v.get("text", '')
-            else:
-                conf = 1
-                text = str(v)
-            status = "CONFIRMED" if conf >= LESSON_GRADUATE_CONFIDENCE else "tentative"
-            existing_text_parts.append(f"  [{k}] (conf={conf}, {status}): {text}")
+            trials = v.get("total_trials", 1)
+            rate   = v.get("success_rate", 1.0)
+            text   = v.get("text", '')
+            status = "CONFIRMED" if (trials >= 3 and rate >= 0.65) else "tentative"
+            existing_text_parts.append(f"  [{k}] (trials={trials}, success={rate:.0%}, {status}): {text}")
         existing_text = "\n".join(existing_text_parts)
     else:
         existing_text = "None yet."
@@ -180,10 +200,12 @@ Your task:
 1. Read each new trade's result, reasoning, and hindsight_feedback.
 2. Extract ONLY lessons that are GENUINELY NEW and not already covered
    by the existing lessons above.
-3. Also check: does any new trade CORROBORATE an existing lesson?
+3. Check: does any new trade CORROBORATE an existing lesson (i.e. proves the lesson rule was RIGHT)?
    If yes, list the corroborated lesson keys in a "corroborations" array.
-4. Format new lessons as short snake_case keys with 2-4 sentence values.
-5. Focus on structural market lessons. Not generic advice.
+4. Check: does any new trade VIOLATE or CONTRADICT an existing lesson (i.e. proves the lesson rule was WRONG in this instance)?
+   If yes, list the violated lesson keys in a "violations" array.
+5. Format new lessons as short snake_case keys with 2-4 sentence values.
+6. Focus on structural market lessons. Not generic advice.
 
 Output ONLY valid JSON with this exact structure:
 {{
@@ -191,10 +213,11 @@ Output ONLY valid JSON with this exact structure:
     "lesson_key_here": "2-4 sentence lesson text here.",
     "another_lesson": "Another lesson."
   }},
-  "corroborations": ["existing_lesson_key_1", "existing_lesson_key_2"]
+  "corroborations": ["existing_lesson_key_1"],
+  "violations": ["existing_lesson_key_2"]
 }}
 
-If there are no new lessons, return: {{"new_lessons": {{}}, "corroborations": []}}
+If there are no new lessons, return: {{"new_lessons": {{}}, "corroborations": [], "violations": []}}
 """
     try:
         raw = call_ai(prompt=prompt)  # FIX C4
@@ -213,23 +236,29 @@ If there are no new lessons, return: {{"new_lessons": {{}}, "corroborations": []
 
     new_lessons_raw = result.get("new_lessons", {})
     corroborations  = result.get("corroborations", [])
+    violations      = result.get("violations", [])
 
+    # Process corroborations
     for key in corroborations:
         if key in existing_lessons:
             entry = existing_lessons[key]
-            if isinstance(entry, dict):
-                entry['confidence'] = entry.get('confidence', 1) + 1
-                entry['last_corroborated'] = datetime.now().strftime('%Y-%m-%d')
-                print(f"[WisdomBuilder] Corroborated: '{key}' "
-                      f"(confidence now {entry['confidence']})")
-            else:
-                existing_lessons[key] = {
-                    'text':               str(entry),
-                    'confidence':         2,
-                    'added_date':         'legacy',
-                    'last_corroborated':  datetime.now().strftime('%Y-%m-%d'),
-                    'rebuild_at_add':     rebuild_count,
-                }
+            entry['corroborations'] += 1
+            entry['total_trials'] = entry['corroborations'] + entry['violations']
+            entry['success_rate'] = round(entry['corroborations'] / entry['total_trials'], 4)
+            entry['last_corroborated'] = datetime.now().strftime('%Y-%m-%d')
+            print(f"[WisdomBuilder] Corroborated: '{key}' "
+                  f"(trials {entry['total_trials']}, success {entry['success_rate']:.0%})")
+
+    # Process violations
+    for key in violations:
+        if key in existing_lessons:
+            entry = existing_lessons[key]
+            entry['violations'] += 1
+            entry['total_trials'] = entry['corroborations'] + entry['violations']
+            entry['success_rate'] = round(entry['corroborations'] / entry['total_trials'], 4)
+            entry['last_violated'] = datetime.now().strftime('%Y-%m-%d')
+            print(f"[WisdomBuilder] VIOLATION: '{key}' "
+                  f"(trials {entry['total_trials']}, success {entry['success_rate']:.0%})")
 
     added = 0
     for key, text in new_lessons_raw.items():
@@ -238,29 +267,38 @@ If there are no new lessons, return: {{"new_lessons": {{}}, "corroborations": []
         if key not in existing_lessons:
             existing_lessons[key] = {
                 'text':              str(text),
-                'confidence':        1,
+                'corroborations':    1,
+                'violations':        0,
+                'total_trials':      1,
+                'success_rate':      1.0,
                 'added_date':        datetime.now().strftime('%Y-%m-%d'),
                 'last_corroborated': None,
                 'rebuild_at_add':    rebuild_count,
             }
             added += 1
-            print(f"[WisdomBuilder] New lesson added: '{key}' (tentative, conf=1)")
+            print(f"[WisdomBuilder] New lesson added: '{key}' (tentative, trials=1)")
         else:
             print(f"[WisdomBuilder] Skipped duplicate: '{key}' already exists.")
 
-    stale_keys = [
-        k for k, v in existing_lessons.items()
-        if isinstance(v, dict)
-        and v.get('confidence', 1) == 1
-        and (rebuild_count - v.get('rebuild_at_add', 0)) >= LESSON_STALE_REBUILDS
-    ]
+    # Prune stale and failing lessons (success < 0.50 after 5+ trials)
+    stale_keys = []
+    failing_keys = []
+    for k, v in list(existing_lessons.items()):
+        if v.get('total_trials', 1) == 1 and (rebuild_count - v.get('rebuild_at_add', 0)) >= LESSON_STALE_REBUILDS:
+            stale_keys.append(k)
+        elif v.get('total_trials', 0) >= 5 and v.get('success_rate', 1.0) < 0.50:
+            failing_keys.append(k)
+
     for k in stale_keys:
         del existing_lessons[k]
         print(f"[WisdomBuilder] Expired stale lesson: '{k}'")
+    for k in failing_keys:
+        del existing_lessons[k]
+        print(f"[WisdomBuilder] Pruned failing lesson: '{k}' (success rate too low)")
 
     print(f"[WisdomBuilder] Lesson update: "
-          f"+{added} new | {len(corroborations)} corroborated | "
-          f"{len(stale_keys)} expired | {len(existing_lessons)} total")
+          f"+{added} new | {len(corroborations)} corroborated | {len(violations)} violated | "
+          f"{len(stale_keys)} expired | {len(failing_keys)} pruned | {len(existing_lessons)} total")
     return existing_lessons
 
 
@@ -360,7 +398,7 @@ def _run_rebuild(tracker, last_ticket, today):
 
     confirmed = sum(
         1 for v in updated_lessons.values()
-        if isinstance(v, dict) and v.get('confidence', 0) >= LESSON_GRADUATE_CONFIDENCE
+        if isinstance(v, dict) and v.get('total_trials', 0) >= 3 and v.get('success_rate', 0.0) >= 0.65
     )
     tentative = len(updated_lessons) - confirmed
     print(f"[WisdomBuilder] Rebuild #{rebuild_count} complete. "

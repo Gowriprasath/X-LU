@@ -106,6 +106,8 @@ def _get_or_init_daily_state(balance):
 # ================================================================
 
 def update_trade_result(result):
+    if os.environ.get("BACKTEST_MODE") == "1":
+        return
     result = result.upper()
     
     def update(state):
@@ -194,6 +196,37 @@ def _get_news_volatility_multiplier(news_data, now_ny=None):
 # ================================================================
 
 def calculate_position_size(symbol, sl_dist, risk_pct=None, news_data=""):
+    if os.environ.get("BACKTEST_MODE") == "1":
+        balance = float(os.environ.get("BACKTEST_CURRENT_BALANCE", "10000.0"))
+        effective_risk_pct = BASE_RISK_PCT
+        if news_data:
+            effective_risk_pct *= 0.5
+        risk_amount = balance * effective_risk_pct
+        
+        tick_size = 0.01
+        tick_value = 1.00 if "XAU" in symbol.upper() or "GOLD" in symbol.upper() else 0.01
+        volume_step = 0.01
+        min_vol = 0.01
+        max_vol = 500.0
+        
+        if mt5.initialize():
+            try:
+                symbol_info = mt5.symbol_info(symbol)
+                if symbol_info:
+                    tick_size = float(symbol_info.trade_tick_size)
+                    tick_value = float(symbol_info.trade_tick_value)
+                    volume_step = float(symbol_info.volume_step)
+                    min_vol = float(symbol_info.volume_min)
+                    max_vol = float(symbol_info.volume_max)
+            finally:
+                mt5.shutdown()
+                
+        ticks_at_risk = sl_dist / tick_size
+        lot_size = risk_amount / (ticks_at_risk * tick_value)
+        lot_size = round(lot_size / volume_step) * volume_step
+        lot_size = max(min_vol, min(lot_size, max_vol))
+        return float(lot_size)
+
     if not mt5.initialize():
         return 0.01
 
@@ -326,6 +359,8 @@ def check_risk_clearance(symbol):
 # ================================================================
 
 def check_consecutive_losses(symbol):
+    if os.environ.get("BACKTEST_MODE") == "1":
+        return True
     state = _read_risk_state()
     if not state:
         return True

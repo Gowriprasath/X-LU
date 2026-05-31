@@ -1025,7 +1025,7 @@ def run_trading_cycle(high_precautions=False):
     # ─────────────────────────────────────────────────────────────
 
     # 9. Build prompt
-    past_lessons    = get_full_memory_context(market_context)
+    past_lessons    = get_full_memory_context(market_context, current_time=get_ny_time())
     current_state   = thought_logger.get_current_state()
     logic_framework   = strategy_logic.get_analytical_framework()
     execution_rules   = strategy_rules.get_execution_rules()
@@ -1036,7 +1036,7 @@ def run_trading_cycle(high_precautions=False):
     # We pass them here so strategy_selector can check AI-discovered strategies first.
     try:
         from context_retriever import _get_current_context_keywords as _get_kws
-        _current_kws = _get_kws(market_context)
+        _current_kws = _get_kws(market_context, current_time=get_ny_time())
     except Exception:
         _current_kws = []
     strategy_result = strategy_selector.select_strategy(

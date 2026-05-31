@@ -244,25 +244,37 @@ def _try_entry(df_m15, sweep_candle_series, direction, setup_type, regime, date,
 
 def _detect_asian_sweeps(day_data, df_m15, date, regime):
     trades = []
-    asian      = day_data.between_time("19:00", "23:59")
+    # Determine previous trading day (if Monday, look back to Friday; otherwise yesterday)
+    prev_day = date - timedelta(days=3 if date.weekday() == 0 else 1)
+    
+    start_asian = pd.Timestamp(datetime.combine(prev_day, datetime.strptime("19:00", "%H:%M").time()))
+    end_asian   = pd.Timestamp(datetime.combine(date, datetime.strptime("01:59", "%H:%M").time()))
+    
+    # Handle timezone localization if the dataframe index is timezone-aware
+    if df_m15.index.tz is not None:
+        start_asian = start_asian.tz_localize(df_m15.index.tz)
+        end_asian   = end_asian.tz_localize(df_m15.index.tz)
+        
+    asian = df_m15[(df_m15.index >= start_asian) & (df_m15.index <= end_asian)]
     ny_confirm = day_data.between_time("07:00", "09:00")
     if asian.empty or ny_confirm.empty:
         return trades
+        
     asian_high = asian["high"].max()
     asian_low  = asian["low"].min()
-
+ 
     swept_high = ny_confirm[ny_confirm["high"] > asian_high]
     if not swept_high.empty:
         t = _try_entry(df_m15, swept_high.iloc[0], "SELL", "ASIAN_HIGH_SWEEP", regime, date,
                        f"Asian High {asian_high:.3f} swept")
         if t: trades.append(t)
-
+ 
     swept_low = ny_confirm[ny_confirm["low"] < asian_low]
     if not swept_low.empty:
         t = _try_entry(df_m15, swept_low.iloc[0], "BUY", "ASIAN_LOW_SWEEP", regime, date,
                        f"Asian Low {asian_low:.3f} swept")
         if t: trades.append(t)
-
+ 
     return trades
 
 

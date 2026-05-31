@@ -25,7 +25,19 @@ from Stability.file_lock_registry import read_json, write_json
 STATE_FILE = CONTINUATION_MEM_PATH
 
 
+_in_memory_state = None
+
 def get_current_state():
+    global _in_memory_state
+    if os.environ.get("BACKTEST_MODE") == "1":
+        if _in_memory_state is None:
+            _in_memory_state = {
+                "current_bias": "NEUTRAL", 
+                "active_thesis": "No previous data found.",
+                "trade_in_progress": False
+            }
+        return _in_memory_state
+
     try:
         state = read_json(STATE_FILE)
         if state:
@@ -40,6 +52,17 @@ def get_current_state():
     }
 
 def update_state(bias, thesis, analysis, trade_active):
+    global _in_memory_state
+    if os.environ.get("BACKTEST_MODE") == "1":
+        if _in_memory_state is None:
+            _in_memory_state = {}
+        _in_memory_state["current_bias"]          = bias
+        _in_memory_state["active_thesis"]         = thesis
+        _in_memory_state["last_analysis_summary"] = analysis
+        _in_memory_state["trade_in_progress"]     = trade_active
+        _in_memory_state["last_update"]           = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return True
+
     # BUG-7 FIX: Lock the entire read-modify-write so concurrent calls
     # (main thread + post-mortem daemon) cannot interleave writes.
     with _state_lock:

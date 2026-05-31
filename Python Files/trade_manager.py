@@ -161,14 +161,22 @@ def get_recent_m5_candles(symbol, count=10):
         mt5.shutdown()
 
 
+_digits_cache = {}
+
 def _get_digits(symbol):
     """Returns the symbol's decimal precision."""
+    global _digits_cache
+    if symbol in _digits_cache:
+        return _digits_cache[symbol]
+
     # B-07 FIX: try/finally guarantees mt5.shutdown() even if symbol_info raises
     if not mt5.initialize():
         return 2
     try:
         si = mt5.symbol_info(symbol)
-        return si.digits if si else 2
+        digits = si.digits if si else 2
+        _digits_cache[symbol] = digits
+        return digits
     finally:
         mt5.shutdown()
 
@@ -233,7 +241,7 @@ def _compute_atr(candles: list, period: int = 10) -> float:
 
 def _call_management_ai(regime: str, confidence: float, direction: str,
                          current_price: float, entry: float, sl: float, tp: float,
-                         stage: int, profit_r: float) -> dict:
+                         stage: int, profit_r: float, sensory_math: dict = None) -> dict:
     """
     Calls the AI for a trade management decision only.
     The prompt is minimal by design — the AI should not re-analyse entry logic,
@@ -242,6 +250,7 @@ def _call_management_ai(regime: str, confidence: float, direction: str,
     Returns dict with "action" key, or None if the AI call fails/times out.
 
     Valid actions:
+      Reversal path:    CLOSE | HOLD
       Trend path:       HOLD | TRAIL_AGGRESSIVE | SKIP_PARTIAL
       Compression path: HOLD | PARTIAL_75 | TIGHT_BE
 
@@ -251,10 +260,39 @@ def _call_management_ai(regime: str, confidence: float, direction: str,
     if call_ai is None:
         return None
 
+    # Load dynamic RAG memory block
+    memory_context = ""
+    try:
+        from Integration.Wisdom_Worker.context_retriever import get_full_memory_context
+        # Use "trade_management" as dummy context to fetch all Layer 1 rules/lessons
+        memory_context = get_full_memory_context("trade_management")
+    except Exception as e:
+        print(f"[HybridManager] Warning: could not load memory context: {e}")
+
+    # Format sensory math block if available
+    sensory_text = ""
+    if sensory_math:
+        sensory_text = (
+            "\n--- REGIME SENSORY MATH ---\n"
+            f"Binary Reversal Prob: {sensory_math.get('reversal_prob', 0.0):.1%}\n"
+            f"Trend Strength (ADX): {sensory_math.get('h1_adx', 0.0):.1f}\n"
+            f"BB Width/Expansion  : {sensory_math.get('h1_bb_width', 0.0):.2f}\n"
+            f"Short-Term ATR Ratio: {sensory_math.get('h1_atr_ratio', 0.0):.2f}\n"
+            f"Upper Wick Rejection: {sensory_math.get('h1_upper_wick_ratio', 0.0):.1%}\n"
+            f"Lower Wick Rejection: {sensory_math.get('h1_lower_wick_ratio', 0.0):.1%}\n"
+        )
+
     risk        = abs(entry - sl)
     to_tp_r     = abs(tp - current_price) / risk if risk > 0 else 0
 
-    if regime in TREND_REGIMES:
+    if regime == "REVERSAL":
+        action_options = "CLOSE, HOLD"
+        guidance = (
+            "- CLOSE: the reversal is structurally real and represents high risk; close full position immediately\n"
+            "- HOLD: the reversal is likely a short-lived fakeout/pullback; do NOT close, let the trade run"
+        )
+        valid_actions = {"CLOSE", "HOLD"}
+    elif regime in TREND_REGIMES:
         action_options = "HOLD, TRAIL_AGGRESSIVE, SKIP_PARTIAL"
         guidance = (
             "- HOLD: price structure intact, keep current SL and TP unchanged\n"
@@ -264,6 +302,7 @@ def _call_management_ai(regime: str, confidence: float, direction: str,
             "- SKIP_PARTIAL: skip the 50% partial close at 1R — let full position "
             "  run to TP because trend momentum justifies it"
         )
+        valid_actions = {"HOLD", "TRAIL_AGGRESSIVE", "SKIP_PARTIAL"}
     else:
         action_options = "HOLD, PARTIAL_75, TIGHT_BE"
         guidance = (
@@ -273,9 +312,12 @@ def _call_management_ai(regime: str, confidence: float, direction: str,
             "- TIGHT_BE: move SL to break-even immediately (at current price) — "
             "  compression means TP is unlikely; protect capital"
         )
+        valid_actions = {"HOLD", "PARTIAL_75", "TIGHT_BE"}
 
     prompt = f"""You are managing an OPEN XAUUSD trade. Do NOT suggest a new entry.
 Only decide how to manage the existing position.
+
+{memory_context}
 
 --- OPEN TRADE STATE ---
 Direction  : {direction}
@@ -290,7 +332,7 @@ Stage      : {stage} (0=watching, 1=BE set, 2=trailing)
 --- REGIME CONTEXT ---
 Regime     : {regime}
 Confidence : {confidence:.0%}
-
+{sensory_text}
 --- MANAGEMENT OPTIONS ---
 {guidance}
 
@@ -313,9 +355,7 @@ Example: {{"action": "HOLD", "reasoning": "Trend intact, no reason to adjust."}}
         if match:
             parsed = json.loads(match.group())
             action = parsed.get("action", "").upper().strip()
-            valid  = {"HOLD", "TRAIL_AGGRESSIVE", "SKIP_PARTIAL",
-                      "PARTIAL_75", "TIGHT_BE"}
-            if action in valid:
+            if action in valid_actions:
                 print(f"[HybridManager] AI decision: {action} — {parsed.get('reasoning','')[:120]}")
                 return parsed
     except Exception as e:
@@ -360,35 +400,57 @@ def _hybrid_dispatch(regime_result: dict, symbol: str, ticket, pos,
 
     digits = _get_digits(symbol)
 
-    # ── 1. REVERSAL — immediate hardcoded full close ────────────────────
+    # ── 1. REVERSAL — dynamic override route ────────────────────
     if regime == "REVERSAL" and confidence >= REVERSAL_CLOSE_THRESHOLD:
-        print(f"[HybridManager] 🔴 REVERSAL ({confidence:.0%}) — "
-              f"Hardcoded FULL CLOSE. No AI call.")
-        result = close_position(ticket, symbol,
-                                comment=f"HybridMgr: REVERSAL ({confidence:.0%})")
-        if result and hasattr(result, 'retcode') and \
-           result.retcode == mt5.TRADE_RETCODE_DONE:
+        print(f"[HybridManager] 🔴 REVERSAL ({confidence:.0%}) detected — Calling AI for dynamic exit override.")
+        sens_math = regime_result.get("sensory_math", {})
+        ai_result = _call_management_ai(
+            regime, confidence, direction,
+            current_price, entry_price, sl_price, tp_price,
+            true_stage, profit_r, sensory_math=sens_math
+        )
+
+        action = "CLOSE"  # default fallback if AI fails or times out
+        if ai_result:
+            action = ai_result.get("action", "CLOSE").upper().strip()
+
+        if action == "HOLD":
+            print(f"[HybridManager] 🤖 AI Overrode REVERSAL! Holding position based on dynamic sensory math.")
             return {
                 "stage":         true_stage,
                 "sl_price":      sl_price,
-                "action_taken":  f"REVERSAL CLOSE: regime={regime} "
-                                 f"conf={confidence:.0%}. Full position closed.",
-                "hybrid_action": "REVERSAL_CLOSE",
-                "force_close":   True,        # main_bot checks this to reset _active_trade
+                "action_taken":  f"REVERSAL HELD (AI Override): {regime} {confidence:.0%} conf. "
+                                 f"Position held based on structural math.",
+                "hybrid_action": "REVERSAL_HOLD_OVERRIDE",
             }
         else:
-            # close_position failed — fall through to mechanical (better than nothing)
-            print(f"[HybridManager] WARNING: close_position() failed for REVERSAL. "
-                  f"Falling through to mechanical management.")
-            return None
+            print(f"[HybridManager] 🔴 REVERSAL Close Confirmed (AI choice: {action}).")
+            result = close_position(ticket, symbol,
+                                    comment=f"HybridMgr: REVERSAL ({confidence:.0%})")
+            if result and hasattr(result, 'retcode') and \
+               result.retcode == mt5.TRADE_RETCODE_DONE:
+                return {
+                    "stage":         true_stage,
+                    "sl_price":      sl_price,
+                    "action_taken":  f"REVERSAL CLOSE: regime={regime} "
+                                     f"conf={confidence:.0%}. Full position closed.",
+                    "hybrid_action": "REVERSAL_CLOSE",
+                    "force_close":   True,        # main_bot checks this to reset _active_trade
+                }
+            else:
+                # close_position failed — fall through to mechanical (better than nothing)
+                print(f"[HybridManager] WARNING: close_position() failed for REVERSAL. "
+                      f"Falling through to mechanical management.")
+                return None
 
     # ── 2. TREND regime with high confidence — AI management call ──────
     if regime in TREND_REGIMES and confidence > TREND_AI_THRESHOLD:
         print(f"[HybridManager] 📈 {regime} ({confidence:.0%}) — Calling AI for management.")
+        sens_math = regime_result.get("sensory_math", {})
         ai_result = _call_management_ai(
             regime, confidence, direction,
             current_price, entry_price, sl_price, tp_price,
-            true_stage, profit_r
+            true_stage, profit_r, sensory_math=sens_math
         )
 
         if ai_result is None:
@@ -420,6 +482,9 @@ def _hybrid_dispatch(regime_result: dict, symbol: str, ticket, pos,
                 candles = get_recent_m5_candles(symbol, count=10)
                 if candles is not None:
                     completed = candles[:-1]
+                    if len(completed) < 2:
+                        return {"stage": true_stage, "sl_price": sl_price, "hybrid_action": "MECHANICAL",
+                                "action_taken": "M5 candles insufficient (< 2 completed). Skipping trail this cycle."}
                     atr       = _compute_atr(completed)
                     dyn_buf   = max(ATR_TRAIL_FLOOR_AGGRESSIVE,
                                     round(atr * ATR_TRAIL_MULT_AGGRESSIVE, 2))
@@ -499,10 +564,11 @@ def _hybrid_dispatch(regime_result: dict, symbol: str, ticket, pos,
     # ── 3. COMPRESSION / LOW_VOL — AI management call ──────────────────
     if regime in COMPRESSION_REGIMES:
         print(f"[HybridManager] 📉 {regime} ({confidence:.0%}) — Calling AI for management.")
+        sens_math = regime_result.get("sensory_math", {})
         ai_result = _call_management_ai(
             regime, confidence, direction,
             current_price, entry_price, sl_price, tp_price,
-            true_stage, profit_r
+            true_stage, profit_r, sensory_math=sens_math
         )
 
         if ai_result is None:
@@ -777,6 +843,9 @@ def manage_trade(symbol, ticket, entry_price, sl_price, tp_price,
 
         # Use last 5 *completed* candles (exclude index -1 which is still forming)
         completed = candles[:-1]
+        if len(completed) < 2:
+            return {"stage": true_stage, "sl_price": sl_price, "hybrid_action": "MECHANICAL",
+                    "action_taken": "M5 candles insufficient (< 2 completed). Skipping trail this cycle."}
         # FIX #4: ATR-proportional buffer (was fixed $0.30).
         # Gold M5 ATR during NY open is $1.50–$4.00. A $0.30 buffer is < 1 ATR
         # and gets wicked on every liquidity sweep before the trend continues.

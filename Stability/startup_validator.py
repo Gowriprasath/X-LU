@@ -11,21 +11,37 @@ from console_display import (
     print_warning,
     print_memory_event,
 )
+from paths import (
+    CONTINUATION_MEM_PATH,
+    TRADE_MEMORY_PATH,
+    EPISODES_PATH,
+    BACKTEST_TRACKER_PATH,
+    WISDOM_PATH,
+    KEYWORDS_PATH,
+    WISDOM_TRACKER_PATH,
+    HUMAN_RULES_PATH,
+)
+# Post mortem tracker path
+import os as _sv_os
+_POST_MORTEM_PATH = _sv_os.path.join(
+    _sv_os.path.dirname(CONTINUATION_MEM_PATH),
+    'post_mortem_tracker.json'
+)
 
 
 CRITICAL_FILES = [
-    ("Memory/continuation_memory.json", None),
-    ("Memory/trade_memory.json", None),
-    ("Memory/post_mortem_tracker.json", None),
+    (CONTINUATION_MEM_PATH, None),
+    (TRADE_MEMORY_PATH, None),
+    (_POST_MORTEM_PATH, None),
 ]
 
 NON_CRITICAL_FILES = [
-    ("Memory/Filter/wisdom.json", []),
-    ("Memory/Filter/keywords.json", []),
-    ("Memory/Filter/wisdom_tracker.json", {}),
-    ("Memory/Filter/human_rules.json", {}),
-    ("Quant/trade_episodes/episodes.json", []),
-    ("Backtest/backtest_tracker.json", {}),
+    (WISDOM_PATH,           []),
+    (KEYWORDS_PATH,         []),
+    (WISDOM_TRACKER_PATH,   {}),
+    (HUMAN_RULES_PATH,      {}),
+    (EPISODES_PATH,         []),
+    (BACKTEST_TRACKER_PATH, {}),
 ]
 
 

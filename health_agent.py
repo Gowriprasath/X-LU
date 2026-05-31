@@ -479,12 +479,23 @@ def check_post_mortem() -> list:
     except Exception:
         return [_warn("Post-mortem", "paths import failed")]
 
-    tracker, err = _load_json(POST_MORTEM_TRACKER)
+    if POST_MORTEM_TRACKER.endswith(".txt"):
+        try:
+            with open(POST_MORTEM_TRACKER, 'r', encoding='utf-8') as _f:
+                _last_run = _f.read().strip()
+            tracker = {"last_run": _last_run} if _last_run else {}
+            err = None
+        except FileNotFoundError:
+            tracker, err = {}, "File not found"
+        except Exception as _e:
+            tracker, err = {}, str(_e)
+    else:
+        tracker, err = _load_json(POST_MORTEM_TRACKER)
     if err or not tracker:
         results.append(_warn("Post-mortem", "Never run yet — runs daily at 17:00 NY"))
         return results
 
-    last_run = tracker.get("last_run_date", "never")
+    last_run = tracker.get("last_run_date", tracker.get("last_run", "never"))
     today    = datetime.now(NY_TZ).strftime("%Y-%m-%d")
     yesterday = (datetime.now(NY_TZ) - timedelta(days=1)).strftime("%Y-%m-%d")
 

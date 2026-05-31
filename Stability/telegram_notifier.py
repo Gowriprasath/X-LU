@@ -24,12 +24,21 @@ _rate_lock: threading.Lock = threading.Lock()
 _MIN_INTERVAL: float = 2.0
 
 if _ENABLED:
-    print("[Telegram] ✓ Notifier ready.")
+    try:
+        print("[Telegram] ✓ Notifier ready.")
+    except UnicodeEncodeError:
+        print("[Telegram] [OK] Notifier ready.")
 else:
-    print(
-        "[Telegram] ⚠️  Not configured — set TELEGRAM_BOT_TOKEN "
-        "and TELEGRAM_CHAT_ID in .env to enable notifications."
-    )
+    try:
+        print(
+            "[Telegram] ⚠️  Not configured — set TELEGRAM_BOT_TOKEN "
+            "and TELEGRAM_CHAT_ID in .env to enable notifications."
+        )
+    except UnicodeEncodeError:
+        print(
+            "[Telegram] [!] Not configured — set TELEGRAM_BOT_TOKEN "
+            "and TELEGRAM_CHAT_ID in .env to enable notifications."
+        )
 
 
 def _now_ny() -> str:

@@ -102,8 +102,10 @@ from paths import (FEATURES_PATH, LABELS_PATH, BIC_PATH,
                    HMM_SCALER_PATH as HMM_SCALER,
                    LABEL_ENCODER_PATH as LE_PATH, REGIME_XGB_PATH as XGB_PATH,
                    MODEL_META_PATH as META_PATH,
+                   SESSION_PROFILES_PATH,
                    REGIME_MODEL as MODEL_DIR, REGIME_DATA as DATA_DIR,
                    create_all_dirs as _cad_tr)
+from master_controls import ACTIVE_REGIME_MODEL
 _cad_tr()
 
 # ================================================================
@@ -160,6 +162,39 @@ HMM_OBS_COLS = [
 ]
 
 # ── Default config ────────────────────────────────────────────────
+# -- Price-only HMM features (used by MODEL_B) -------------------------------
+# These are pure market structure indicators - no session/time context.
+HMM_COLS_PRICE_ONLY = [
+    'h1__atr_raw', 'h4__atr_raw',
+    'h1_atr_ratio', 'h4_atr_ratio',
+    'h1_adx', 'h4_adx',
+    'h1_plus_di', 'h1_minus_di',
+    'h1_momentum_20', 'h4_momentum_20',
+    'h1_bb_width', 'h1_trend_structure',
+    'h4_ema_stack',
+]
+
+# -- Full HMM features including time context (used by MODEL_A) --------------
+HMM_COLS_WITH_TIME = HMM_COLS_PRICE_ONLY + [
+    'hour_sin', 'hour_cos',
+    'is_asian', 'is_london', 'is_ny',
+    'dow_sin', 'dow_cos',
+    'is_monday', 'is_friday',
+]
+
+# -- Active HMM feature set - selected by variant ----------------------------
+if ACTIVE_REGIME_MODEL == "MODEL_B_HMM_NO_TIME":
+    HMM_COLS = HMM_COLS_PRICE_ONLY
+    print(f"[Trainer] Variant: MODEL_B - HMM uses {len(HMM_COLS)} price features "
+          f"(no time/session features)")
+else:
+    HMM_COLS = HMM_COLS_WITH_TIME
+    print(f"[Trainer] Variant: MODEL_A - HMM uses {len(HMM_COLS)} features "
+          f"(price + time/session)")
+
+# Keep backward compat alias.
+HMM_OBS_COLS = HMM_COLS
+
 DEFAULT_N_STATES = 5      # 5 states for XAUUSD (see architecture above)
 DEFAULT_N_MIX    = 3      # GMM mixtures per state
 DEFAULT_N_ITER   = 200    # EM iterations per init
@@ -707,6 +742,8 @@ def train(date_from=None, date_to=None, rebuild_features=True,
     print("=" * 65)
     print("  Antigravity Bridge — GMM-HMM (5-state) + XGBoost Trainer v3")
     print("=" * 65)
+    print(f"[Trainer] Active variant: {ACTIVE_REGIME_MODEL}")
+    print(f"[Trainer] Models will save to: {MODEL_DIR}")
 
     # ── Load / build features ─────────────────────────────────────
     if rebuild_features or not os.path.exists(FEATURES_PATH):
@@ -911,6 +948,9 @@ def train(date_from=None, date_to=None, rebuild_features=True,
 
     meta = {
         "trained_date":        pd.Timestamp.now().strftime('%Y-%m-%d %H:%M'),
+        "variant":             ACTIVE_REGIME_MODEL,
+        "hmm_uses_time_features": (ACTIVE_REGIME_MODEL != "MODEL_B_HMM_NO_TIME"),
+        "hmm_obs_feature_count": len(HMM_COLS),
         "architecture":        "GMM-HMM (5-state, time-conditioned) + XGBoost v5",
         "regime_system":       "REVERSAL/BULL_TREND/BEAR_TREND/COMPRESSION/LOW_VOL_RANGE",
         "normalisation":       "rolling_zscore_window500_tf_cols_only",
@@ -935,7 +975,7 @@ def train(date_from=None, date_to=None, rebuild_features=True,
         "top_features":        xgb_results.get("top_features", []),
         "feature_cols":        avail,
         "n_feature_cols":      len(avail),
-        "persistence_cols":    PERSISTENCE_FEATURE_COLS,
+        "persistence_cols":    SAFE_PERSISTENCE_COLS,
         "regimes":             ALL_REGIMES,
         "date_from":           str(date_from) if date_from else "all",
         "date_to":             str(date_to)   if date_to   else "all",
@@ -959,7 +999,7 @@ def train(date_from=None, date_to=None, rebuild_features=True,
     try:
         from session_profiler import build_session_profiles
         build_session_profiles(labels, features)
-        print("✅ Saved: Session profiles → Data/Models/Regime/session_profiles.json")
+        print(f"✅ Saved: Session profiles → {SESSION_PROFILES_PATH}")
     except Exception as e:
         print(f"⚠  Session profiler failed (non-fatal): {e}")
 
@@ -973,7 +1013,10 @@ def train(date_from=None, date_to=None, rebuild_features=True,
         # Pass X_prefisf (pre-FISF full feature matrix) — NOT X_final.
         # FISF drops h1_bb_width, h1_atr_ratio etc. which the reversal
         # detector hard-requires. X_prefisf has all columns intact.
-        rev_results = train_reversal(X_prefisf, y, verbose=True)
+        # FIX: apply same valid mask used for y — prevents index/NaN mismatch
+        # that caused XGBoost to early-stop at tree 4 with zero recall.
+        X_prefisf_valid = X_prefisf[valid]
+        rev_results = train_reversal(X_prefisf_valid, y, verbose=True)
         if rev_results:
             print(f"✅ REVERSAL pre-filter: "
                   f"recall={rev_results.get('recall',0):.3f} "

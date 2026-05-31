@@ -1,8 +1,25 @@
 __pycache__/
 *.pyc
+*.pyo
 .env
 .venv
 env/
 venv/
+
+# Large data / model artefacts
 Data/
 *.csv
+*.joblib
+*.ubj
+*.pkl
+
+# Runtime logs
+*.log
+*.txt
+backtest_run.log
+backtest_log.txt
+retrain.log
+regime_detector_source.txt
+
+# Scratch / one-off test scripts
+scratch/

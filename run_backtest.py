@@ -32,6 +32,31 @@ import importlib.util
 import subprocess
 from datetime import datetime
 
+# Unicode safe global stream wrappers for Windows console compatibility
+class UnicodeSafeWriter:
+    def __init__(self, original_stream):
+        self.original_stream = original_stream
+        self.encoding = original_stream.encoding or 'utf-8'
+
+    def write(self, text):
+        try:
+            self.original_stream.write(text)
+        except UnicodeEncodeError:
+            safe_text = text.replace("✅", "[✓]").replace("✓", "[v]").replace("❌", "[x]").replace("⚠️", "[!]").replace("ℹ️", "[i]").replace("🏁", "[*]").replace("⚡", "[+]")
+            try:
+                self.original_stream.write(safe_text.encode(self.encoding, errors='replace').decode(self.encoding))
+            except Exception:
+                self.original_stream.write(safe_text.encode('ascii', errors='replace').decode('ascii'))
+
+    def flush(self):
+        self.original_stream.flush()
+
+    def __getattr__(self, attr):
+        return getattr(self.original_stream, attr)
+
+sys.stdout = UnicodeSafeWriter(sys.stdout)
+sys.stderr = UnicodeSafeWriter(sys.stderr)
+
 # ── Paths ──────────────────────────────────────────────────────────
 SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
 BACKTEST_DIR = os.path.join(SCRIPT_DIR, 'Backtest')
@@ -45,7 +70,10 @@ ENGINE       = os.path.join(BACKTEST_DIR, 'backtest_engine.py')
 def banner():
     print()
     print("=" * 65)
-    print("  ⚡ ANTIGRAVITY BRIDGE — BACKTEST ORCHESTRATOR")
+    try:
+        print("  ⚡ ANTIGRAVITY BRIDGE — BACKTEST ORCHESTRATOR")
+    except UnicodeEncodeError:
+        print("  [+] ANTIGRAVITY BRIDGE — BACKTEST ORCHESTRATOR")
     print("=" * 65)
     print(f"  Started : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  Root    : {SCRIPT_DIR}")

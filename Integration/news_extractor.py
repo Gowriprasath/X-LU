@@ -112,7 +112,22 @@ def _daily_refresh_loop():
     global _fetch_failed
     print(f"[NewsExtractor] 📅 Daily news refresh daemon started. "
           f"Fetches at {_REFRESH_HOUR_NY:02d}:{_REFRESH_MINUTE_NY:02d} NY every morning.")
-    while True:
+    
+    def _is_shutting_down():
+        try:
+            import main_bot as _mb
+            return _mb._shutdown_event.is_set()
+        except Exception:
+            return False
+
+    def _sleep_with_shutdown_check(seconds):
+        slept = 0
+        while slept < seconds and not _is_shutting_down():
+            time.sleep(min(5, seconds - slept))
+            slept += 5
+        return not _is_shutting_down()
+
+    while not _is_shutting_down():
         now_ny = datetime.now(NY_TZ)
         target = now_ny.replace(hour=_REFRESH_HOUR_NY, minute=_REFRESH_MINUTE_NY,
                                 second=0, microsecond=0)
@@ -121,17 +136,17 @@ def _daily_refresh_loop():
         sleep_s = (target - now_ny).total_seconds()
         print(f"[NewsExtractor] Next refresh: {target.strftime('%Y-%m-%d %H:%M')} NY "
               f"(in {sleep_s/3600:.1f}h)")
-        slept = 0
-        while slept < sleep_s:
-            time.sleep(min(60, sleep_s - slept))
-            slept += 60
+        
+        # Sleep until 06:30 NY daily, checking shutdown event every 5 seconds
+        if not _sleep_with_shutdown_check(sleep_s):
+            break
 
         # It's 06:30 — fetch with retry window until 08:00
         retry_cutoff = datetime.now(NY_TZ).replace(
             hour=_RETRY_UNTIL_HOUR, minute=0, second=0)
         fetched  = False
         attempt  = 0
-        while not fetched:
+        while not fetched and not _is_shutting_down():
             print(f"[NewsExtractor] 🔄 Daily fetch attempt {attempt+1} "
                   f"at {datetime.now(NY_TZ).strftime('%H:%M')} NY...")
             result = _fetch_from_api()
@@ -153,8 +168,13 @@ def _daily_refresh_loop():
                 remaining = (retry_cutoff - now_ny).total_seconds() / 60
                 print(f"[NewsExtractor] Retry in {_RETRY_INTERVAL_S//60} min "
                       f"({remaining:.0f} min until cutoff)...")
-                time.sleep(_RETRY_INTERVAL_S)
+                
+                # Sleep between retries with shutdown checks
+                if not _sleep_with_shutdown_check(_RETRY_INTERVAL_S):
+                    break
                 attempt += 1
+
+    print("[NewsExtractor] Shutdown signal received. Exiting loop cleanly.")
 
 
 def start_daily_news_daemon():

@@ -66,8 +66,19 @@ DATA_ROOT = os.path.join(PROJECT_ROOT, 'Data')
 # SUBDIRECTORIES
 # ══════════════════════════════════════════════════════════════════════
 MARKET_DIR      = os.path.join(DATA_ROOT, 'Market')
-REGIME_MODEL    = os.path.join(DATA_ROOT, 'Models', 'Regime')
 META_MODEL      = os.path.join(DATA_ROOT, 'Models', 'Meta')
+
+# -- Regime Model Variant Paths -----------------------------------------------
+# Paths resolve through the active variant set in master_controls.py.
+# Switching ACTIVE_REGIME_MODEL updates all regime model paths automatically.
+from master_controls import ACTIVE_REGIME_MODEL
+
+REGIME_VARIANT_DIR    = os.path.join(DATA_ROOT, 'ModelVariants',
+                                     ACTIVE_REGIME_MODEL)
+REGIME_MODEL          = os.path.join(REGIME_VARIANT_DIR, 'Models')
+REGIME_TRAINING_DIR   = os.path.join(REGIME_VARIANT_DIR, 'TrainingData')
+REGIME_BACKTEST_DIR   = os.path.join(REGIME_VARIANT_DIR, 'BacktestResults')
+REGIME_VARIANT_CONFIG = os.path.join(REGIME_VARIANT_DIR, 'variant_config.json')
 
 # Step 1 — Champion/Challenger staging area
 # Challenger models are written here; promoted to REGIME_MODEL only on approval.
@@ -77,12 +88,12 @@ CHAMPION_LOG_PATH     = os.path.join(DATA_ROOT, 'Regime', 'champion_challenger_l
 # Step 2 — Versioned model archive (rollback support)
 # Layout: Data/Models/Versions/v{YYYY_MM_DD_HHMM}/  — keeps last 5 by default.
 VERSIONS_DIR          = os.path.join(DATA_ROOT, 'Models', 'Versions')
-CURRENT_VERSION_PATH  = os.path.join(DATA_ROOT, 'Models', 'Regime', 'current_version.txt')
+CURRENT_VERSION_PATH  = os.path.join(REGIME_MODEL, 'current_version.txt')
 
 # Step 4 — Optuna best-params cache
 # trainer.py loads this if it exists; otherwise uses hardcoded defaults.
-OPTUNA_PARAMS_PATH    = os.path.join(DATA_ROOT, 'Models', 'Regime', 'best_xgb_params.json')
-OPTUNA_STUDY_PATH     = os.path.join(DATA_ROOT, 'Models', 'Regime', 'optuna_study.json')
+OPTUNA_PARAMS_PATH    = os.path.join(REGIME_MODEL, 'best_xgb_params.json')
+OPTUNA_STUDY_PATH     = os.path.join(REGIME_MODEL, 'optuna_study.json')
 
 MEMORY_DIR      = os.path.join(DATA_ROOT, 'Memory')
 FILTER_DIR      = os.path.join(DATA_ROOT, 'Memory', 'Filter')
@@ -91,6 +102,8 @@ EPISODES_DIR    = os.path.join(DATA_ROOT, 'Episodes')
 META_DATA       = os.path.join(DATA_ROOT, 'Meta')
 BACKTEST_OUT    = os.path.join(DATA_ROOT, 'Backtest')
 LOGS_DIR        = os.path.join(DATA_ROOT, 'Logs')
+TRADE_LOGS_DIR  = os.path.join(LOGS_DIR, 'Trades')
+
 
 # ══════════════════════════════════════════════════════════════════════
 # MARKET DATA
@@ -102,28 +115,30 @@ MARKET_DATA_DIR = MARKET_DIR   # root folder — individual CSVs live here
 # ══════════════════════════════════════════════════════════════════════
 HMM_PATH              = os.path.join(REGIME_MODEL, 'gmmhmm_model.joblib')
 HMM_SCALER_PATH       = os.path.join(REGIME_MODEL, 'hmm_scaler.joblib')
-REGIME_XGB_PATH       = os.path.join(REGIME_MODEL, 'regime_model.ubj')
-REGIME_SCALER_PATH    = os.path.join(REGIME_MODEL, 'scaler.joblib')
+REGIME_SCALER_PATH    = HMM_SCALER_PATH
 LABEL_ENCODER_PATH    = os.path.join(REGIME_MODEL, 'label_encoder.joblib')
+REGIME_XGB_PATH       = os.path.join(REGIME_MODEL, 'regime_model.ubj')
 MODEL_META_PATH       = os.path.join(REGIME_MODEL, 'model_meta.json')
-SESSION_PROFILES_PATH = os.path.join(REGIME_MODEL, 'session_profiles.json')
+REVERSAL_DETECTOR_PATH = os.path.join(REGIME_MODEL, 'reversal_detector.ubj')
 FISF_PRIMARY_PATH     = os.path.join(REGIME_MODEL, 'fisf_primary.json')
+SESSION_PROFILES_PATH = os.path.join(REGIME_MODEL, 'session_profiles.json')
+DRIFT_LOG_PATH        = os.path.join(REGIME_MODEL, 'drift_log.json')
+RELOAD_FLAG_PATH      = os.path.join(REGIME_MODEL, 'reload_flag.json')
 FISF_META_PATH        = os.path.join(REGIME_MODEL, 'fisf_meta.json')
 BIC_PATH              = os.path.join(REGIME_MODEL, 'bic_selection.json')
 
 # REVERSAL binary pre-filter — trained alongside the main model
 # Separate binary XGBoost: "is this REVERSAL or not"
 # Runs first in predict(); overrides 5-class model when confident
-REVERSAL_DETECTOR_PATH     = os.path.join(REGIME_MODEL, 'reversal_detector.ubj')
 REVERSAL_DETECTOR_META_PATH= os.path.join(REGIME_MODEL, 'reversal_detector_meta.json')
 
 # ══════════════════════════════════════════════════════════════════════
 # REGIME TRAINING DATA  (Data/Regime/)
 # ══════════════════════════════════════════════════════════════════════
-FEATURES_PATH         = os.path.join(REGIME_DATA, 'features.csv')
-LABELS_PATH           = os.path.join(REGIME_DATA, 'labels.csv')
-DRIFT_LOG_PATH        = os.path.join(REGIME_DATA, 'drift_log.json')
-RELOAD_FLAG_PATH      = os.path.join(REGIME_DATA, 'reload_flag.json')
+FEATURES_PATH         = os.path.join(REGIME_TRAINING_DIR, 'features.csv')
+LABELS_PATH           = os.path.join(REGIME_TRAINING_DIR, 'labels.csv')
+FEATURES_CSV_PATH     = FEATURES_PATH
+LABELS_CSV_PATH       = LABELS_PATH
 RETRAIN_HISTORY_PATH  = os.path.join(REGIME_DATA, 'retrain_history.json')
 
 # ══════════════════════════════════════════════════════════════════════
@@ -144,6 +159,7 @@ TRADE_MEMORY_PATH       = os.path.join(MEMORY_DIR, 'trade_memory.json')
 CONTINUATION_MEM_PATH   = os.path.join(MEMORY_DIR, 'continuation_memory.json')
 RISK_STATE_PATH         = os.path.join(MEMORY_DIR, 'risk_state.json')
 SHADOW_JOURNAL_PATH     = os.path.join(MEMORY_DIR, 'shadow_journal.json')
+GATE_REVIEW_PATH        = os.path.join(MEMORY_DIR, 'claude_gate_review.json')
 MISSWISH_MEMORY_PATH    = os.path.join(MEMORY_DIR, 'misswish_memory.json')
 SCOUT_LOG_PATH          = os.path.join(MEMORY_DIR, 'strategy_scout_log.json')
 COUNTERFACTUAL_LOG_PATH = os.path.join(MEMORY_DIR, 'counterfactual_log.json')
@@ -170,9 +186,9 @@ ACTIVE_EPISODE_PATH   = os.path.join(EPISODES_DIR, 'active_episode.json')
 # ══════════════════════════════════════════════════════════════════════
 # BACKTEST OUTPUTS  (Data/Backtest/)
 # ══════════════════════════════════════════════════════════════════════
-BACKTEST_TRACKER_PATH    = os.path.join(BACKTEST_OUT, 'backtest_tracker.json')
+BACKTEST_TRACKER_PATH    = os.path.join(REGIME_BACKTEST_DIR, 'backtest_tracker.json')
 DOWNLOAD_PROGRESS_PATH   = os.path.join(BACKTEST_OUT, 'download_progress.json')
-PNL_STATS_PATH           = os.path.join(BACKTEST_OUT, 'pnl_stats.json')
+PNL_STATS_PATH           = os.path.join(REGIME_BACKTEST_DIR, 'pnl_stats.json')
 
 # News calendar — real ForexFactory data (populated by ff_fetcher.py)
 # Falls back to seeded approximations in news_history.py if not yet fetched.
@@ -213,6 +229,8 @@ def create_all_dirs():
     dirs = [
         MARKET_DIR,
         REGIME_MODEL,
+        REGIME_TRAINING_DIR,
+        REGIME_BACKTEST_DIR,
         META_MODEL,
         CHALLENGER_DIR,          # Step 1 — challenger staging
         VERSIONS_DIR,            # Step 2 — versioned archive
@@ -223,6 +241,7 @@ def create_all_dirs():
         META_DATA,
         BACKTEST_OUT,
         LOGS_DIR,
+        TRADE_LOGS_DIR,
         PROPOSALS_DIR,
         CONFIRMED_DIR,
     ]

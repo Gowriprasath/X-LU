@@ -170,6 +170,7 @@ def _load_model():
     global _model, _le, _mode, _trained_cols, _persistence_transmat
     global _reversal_filter_loaded
 
+    print(f"[RegimeDetector] Loading model from: {XGB_PATH} (exists: {os.path.exists(XGB_PATH)})")
     if os.path.exists(XGB_PATH):
         try:
             import xgboost as xgb
@@ -234,7 +235,7 @@ def _load_model():
               f"(run trainer.py to build it)")
 
 
-def predict(h1_df, m5_df=None, h4_df=None, d1_df=None):
+def predict(h1_df=None, m5_df=None, h4_df=None, d1_df=None, precomputed_raw=None, precomputed_z=None):
     """
     Main entry point — called every cycle from main_bot.py and regime_router.py.
 
@@ -253,34 +254,41 @@ def predict(h1_df, m5_df=None, h4_df=None, d1_df=None):
         _load_model()
 
     try:
-        if (m5_df is not None and h4_df is not None and
-                d1_df is not None and not m5_df.empty):
-            features = build_multi_tf_features(m5_df, h1_df, h4_df, d1_df)
+        if precomputed_raw is not None and precomputed_z is not None:
+            latest_raw = precomputed_raw
+            latest_z = precomputed_z
         else:
-            h1_feats   = build_features(h1_df, prefix='h1')
-            time_feats = build_time_features(h1_df.index)
-            features   = pd.concat([h1_feats, time_feats], axis=1).dropna()
+            if h1_df is None:
+                print("[RegimeDetector] h1_df is required if no precomputed features are provided.")
+                return _safe_default()
+            if (m5_df is not None and h4_df is not None and
+                    d1_df is not None and not m5_df.empty):
+                features = build_multi_tf_features(m5_df, h1_df, h4_df, d1_df)
+            else:
+                h1_feats   = build_features(h1_df, prefix='h1')
+                time_feats = build_time_features(h1_df.index)
+                features   = pd.concat([h1_feats, time_feats], axis=1).dropna()
 
-        if features.empty:
-            print("[RegimeDetector] Insufficient candles for prediction.")
-            return _safe_default()
+            if features.empty:
+                print("[RegimeDetector] Insufficient candles for prediction.")
+                return _safe_default()
 
-        # ── Apply rolling z-score to TF cols on the entire features DataFrame first ──
-        # This prevents the single-row z-scoring from zeroing out standard deviation.
-        from feature_engineer import apply_rolling_zscore, TF_FEATURE_COLS
-        
-        features_raw = features.copy()
-        
-        # O(N^2) FIX: Only calculate the rolling metric on the trailing window, not the whole history
-        window = 500
-        sliced_features = features.iloc[-window:] if len(features) >= window else features
-        
-        tf_cols = [c for c in TF_FEATURE_COLS if c in features.columns]
-        features_z = apply_rolling_zscore(sliced_features, cols=tf_cols, window=window)
-        features_z = features_z.fillna(0.0)
+            # ── Apply rolling z-score to TF cols on the entire features DataFrame first ──
+            # This prevents the single-row z-scoring from zeroing out standard deviation.
+            from feature_engineer import apply_rolling_zscore, TF_FEATURE_COLS
+            
+            features_raw = features.copy()
+            
+            # O(N^2) FIX: Only calculate the rolling metric on the trailing window, not the whole history
+            window = 500
+            sliced_features = features.iloc[-window:] if len(features) >= window else features
+            
+            tf_cols = [c for c in TF_FEATURE_COLS if c in features.columns]
+            features_z = apply_rolling_zscore(sliced_features, cols=tf_cols, window=window)
+            features_z = features_z.fillna(0.0)
 
-        latest_raw = features_raw.iloc[[-1]]
-        latest_z = features_z.iloc[[-1]]
+            latest_raw = features_raw.iloc[[-1]]
+            latest_z = features_z.iloc[[-1]]
 
         if _mode == "model":
             return _predict_xgb(latest_z, latest_raw, state_map=_state_map)
@@ -386,6 +394,15 @@ def _predict_xgb(latest_z, latest_raw, state_map=None):
                           f"P={rev_prob:.2f} ≥ {_rd.REVERSAL_FIRE_THRESHOLD} "
                           f"[binary/XGB]")
                     tf = compute_transition_forecast(REGIME_REVERSAL)
+                    # Extract sensory math for early exit
+                    sensory_math = {}
+                    for col in ['h1_adx', 'h1_bb_width', 'h1_atr_ratio', 'h1_upper_wick_ratio', 'h1_lower_wick_ratio']:
+                        if col in latest_raw.columns and not pd.isna(latest_raw[col].iloc[0]):
+                            sensory_math[col] = float(latest_raw[col].iloc[0])
+                        else:
+                            sensory_math[col] = 0.0
+                    sensory_math['reversal_prob'] = float(rev_prob)
+
                     return {
                         "regime":        REGIME_REVERSAL,
                         "confidence":    round(rev_prob, 3),
@@ -399,6 +416,7 @@ def _predict_xgb(latest_z, latest_raw, state_map=None):
                             "regime_duration_mean":       round(dur_mean, 1),
                             "regime_transition_prob":     0.5,
                         },
+                        "sensory_math": sensory_math
                     }
             except Exception as _stage1_err:
                 pass   # Stage 1 failure is non-fatal — fall through to Stage 2
@@ -464,8 +482,9 @@ def _predict_xgb(latest_z, latest_raw, state_map=None):
 
         # ── Step 9: UNCERTAIN threshold ───────────────────────────
         if conf < UNCERTAIN_THRESHOLD:
-            print(f"[RegimeDetector] UNCERTAIN (raw={raw_regime}, conf={conf:.2f} "
-                  f"< {UNCERTAIN_THRESHOLD}) — skipping trade")
+            if os.environ.get("BACKTEST_MODE") != "1":
+                print(f"[RegimeDetector] UNCERTAIN (raw={raw_regime}, conf={conf:.2f} "
+                      f"< {UNCERTAIN_THRESHOLD}) — skipping trade")
             return {
                 "regime":        "UNCERTAIN",
                 "confidence":    round(conf, 3),
@@ -492,9 +511,10 @@ def _predict_xgb(latest_z, latest_raw, state_map=None):
             p_bear  = probabilities.get(REGIME_BEAR_TREND, 0.0)
             dir_gap = round(abs(p_bull - p_bear), 3)
             if dir_gap < DIRECTIONAL_MIN_MARGIN:
-                print(f"[RegimeDetector] Directional margin too narrow "
-                      f"(P_bull={p_bull:.2f} P_bear={p_bear:.2f} gap={dir_gap:.2f} "
-                      f"< {DIRECTIONAL_MIN_MARGIN}) → LOW_VOL_RANGE")
+                if os.environ.get("BACKTEST_MODE") != "1":
+                    print(f"[RegimeDetector] Directional margin too narrow "
+                          f"(P_bull={p_bull:.2f} P_bear={p_bear:.2f} gap={dir_gap:.2f} "
+                          f"< {DIRECTIONAL_MIN_MARGIN}) → LOW_VOL_RANGE")
                 raw_regime      = REGIME_LOW_VOL_RANGE
                 downgrade_fired = True
 
@@ -509,15 +529,38 @@ def _predict_xgb(latest_z, latest_raw, state_map=None):
         # Update tracker with smoothed regime
         candles_since, dur_mean, prev_enc = _update_persistence(smoothed_regime)
 
-        print(f"[RegimeDetector] {smoothed_regime} "
-              f"(raw={raw_regime}, conf={conf:.2f}) "
-              f"vote={regime_votes}/{len(pre_smooth_buffer)+1} "
-              f"| age={int(candles_since)}c "
-              f"| trans_p={trans_prob:.2f} "
-              f"[XGB/GMM-HMM v5]")
+        if os.environ.get("BACKTEST_MODE") != "1":
+            print(f"[RegimeDetector] {smoothed_regime} "
+                  f"(raw={raw_regime}, conf={conf:.2f}) "
+                  f"vote={regime_votes}/{len(pre_smooth_buffer)+1} "
+                  f"| age={int(candles_since)}c "
+                  f"| trans_p={trans_prob:.2f} "
+                  f"[XGB/GMM-HMM v5]")
 
         # Log to drift_log.json — auto_retrainer reads this every 4h
         log_prediction(smoothed_regime, conf, latest_features=latest_raw)
+
+        # Extract sensory math for Stage 2
+        sensory_math = {}
+        try:
+            for col in ['h1_adx', 'h1_bb_width', 'h1_atr_ratio', 'h1_upper_wick_ratio', 'h1_lower_wick_ratio']:
+                if col in latest_raw.columns and not pd.isna(latest_raw[col].iloc[0]):
+                    sensory_math[col] = float(latest_raw[col].iloc[0])
+                else:
+                    sensory_math[col] = 0.0
+            
+            # Reversal probability if loaded
+            if _reversal_filter_loaded:
+                try:
+                    import reversal_detector as _rd
+                    _, rev_prob = _rd.is_reversal(latest_z)
+                    sensory_math['reversal_prob'] = float(rev_prob)
+                except Exception:
+                    sensory_math['reversal_prob'] = 0.0
+            else:
+                sensory_math['reversal_prob'] = 0.0
+        except Exception:
+            pass
 
         result = {
             "regime":        smoothed_regime,
@@ -545,6 +588,7 @@ def _predict_xgb(latest_z, latest_raw, state_map=None):
                 "uncertain_threshold": UNCERTAIN_THRESHOLD,
                 "directional_margin":  DIRECTIONAL_MIN_MARGIN,
             },
+            "sensory_math": sensory_math
         }
 
         # ── HMM transition forecast ───────────────────────────────
@@ -580,6 +624,8 @@ def _predict_xgb(latest_z, latest_raw, state_map=None):
 
 
 def log_prediction(regime, confidence, latest_features=None):
+    if os.environ.get("BACKTEST_MODE") == "1":
+        return
     """
     Logs each XGBoost prediction to drift_log.json.
     Called from _predict_xgb() after every successful prediction.
@@ -701,7 +747,10 @@ def reload_if_needed():
 def _predict_fallback(latest):
     """Threshold-based fallback — ADX/ATR rules (labeler.py logic)."""
     labels = label_candles(latest)
-    regime = labels.iloc[0]
+    if labels.empty:
+        regime = REGIME_LOW_VOL_RANGE
+    else:
+        regime = labels.iloc[0]
     print(f"[RegimeDetector] {regime} [fallback thresholds]")
     return {
         "regime":        regime,

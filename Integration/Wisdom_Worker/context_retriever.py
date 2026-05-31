@@ -100,26 +100,54 @@ def _get_wisdom_block():
                   "No lessons yet. Will populate after first trading week.\n")
         return block
 
-    confirmed = {k: v for k, v in ai_lessons.items()
-                 if isinstance(v, dict) and v.get("confidence", 1) >= 3}
-    tentative = {k: v for k, v in ai_lessons.items()
-                 if isinstance(v, dict) and v.get("confidence", 1) < 3}
+    confirmed = {}
+    tentative = {}
+
+    for k, v in ai_lessons.items():
+        if k.startswith("_"):
+            continue
+        if not isinstance(v, dict):
+            tentative[k] = {
+                "text": str(v),
+                "total_trials": 1,
+                "success_rate": 1.0
+            }
+        else:
+            corrobs = v.get("corroborations", v.get("confidence", 1))
+            viols   = v.get("violations", 0)
+            trials  = v.get("total_trials", corrobs + viols)
+            rate    = v.get("success_rate", 1.0 if trials == 0 else corrobs / trials)
+            
+            entry = {
+                "text":         v.get("text", ""),
+                "total_trials": trials,
+                "success_rate": rate
+            }
+            
+            if trials >= 3 and rate < 0.50:
+                continue  # Filter out low-success lessons
+                
+            if trials >= 3 and rate >= 0.65:
+                confirmed[k] = entry
+            else:
+                tentative[k] = entry
 
     if confirmed:
-        block += "--- CONFIRMED LESSONS (corroborated by 3+ trades) ---\n"
+        block += "--- CONFIRMED LESSONS (corroborated by 3+ trades with >=65% success) ---\n"
         for key, entry in confirmed.items():
-            text = entry.get("text", str(entry))
-            conf = entry.get("confidence", 1)
-            block += f"  ✓ [{key}] (conf={conf}): {text}\n"
+            text   = entry["text"]
+            trials = entry["total_trials"]
+            rate   = entry["success_rate"]
+            block += f"  ✓ [{key}] (trials={trials}, success={rate:.0%}): {text}\n"
         block += "\n"
 
     if tentative:
-        block += ("--- TENTATIVE OBSERVATIONS (not yet corroborated — "
-                  "weight lower than confirmed) ---\n")
+        block += ("--- TENTATIVE OBSERVATIONS (not yet corroborated or lower success rate) ---\n")
         for key, entry in tentative.items():
-            text = entry.get("text", str(entry))
-            conf = entry.get("confidence", 1)
-            block += f"  ? [{key}] (conf={conf}): {text}\n"
+            text   = entry["text"]
+            trials = entry["total_trials"]
+            rate   = entry["success_rate"]
+            block += f"  ? [{key}] (trials={trials}, success={rate:.0%}): {text}\n"
         block += "\n"
 
     return block
@@ -385,6 +413,7 @@ def _get_confirmed_strategies_block() -> str:
     try:
         import sys as _sys
         # _strat_dir now resolved via CONFIRMED_DIR from paths.py
+        _strat_dir = str(CONFIRMED_DIR)
         if _strat_dir not in _sys.path:
             _sys.path.insert(0, _strat_dir)
         from strategy_loader import get_confirmed_strategy_list
@@ -428,7 +457,8 @@ def get_full_memory_context(market_context: str,
                 Without current_time the cache falls back to a single
                 global slot (acceptable for live bot; ideal for backtest).
     """
-    print("[ContextRetriever] Assembling memory context...")
+    if os.environ.get("BACKTEST_MODE") != "1":
+        print("[ContextRetriever] Assembling memory context...")
     layer1 = _get_wisdom_block()
     layer2 = _get_recent_trades_block()
 

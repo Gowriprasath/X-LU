@@ -129,8 +129,25 @@ def _fetch_day_candles(date_str: str,
         return None
 
     try:
-        m5_rates = mt5.copy_rates_range(SYMBOL, mt5.TIMEFRAME_M5, start_dt, end_dt)
-        h1_rates = mt5.copy_rates_range(SYMBOL, mt5.TIMEFRAME_H1, start_dt, end_dt)
+        # Retrieve the broker timezone dynamically before shutting down MT5
+        try:
+            sys.path.append(os.path.join(base_dir, "Python Files"))
+            from data_extractor import _get_broker_tz
+            broker_tz = _get_broker_tz()
+        except Exception:
+            broker_tz = pytz.timezone("Etc/GMT-3")  # Fallback to GMT+3 (broker time)
+
+        # Localize naive dates to New York time (representing the NY trading day)
+        ny_tz = pytz.timezone('America/New_York')
+        s_dt_ny = ny_tz.localize(start_dt)
+        e_dt_ny = ny_tz.localize(end_dt)
+
+        # Convert to broker timezone and make naive (as copy_rates_range expects naive broker time)
+        s_dt_broker = s_dt_ny.astimezone(broker_tz).replace(tzinfo=None)
+        e_dt_broker = e_dt_ny.astimezone(broker_tz).replace(tzinfo=None)
+
+        m5_rates = mt5.copy_rates_range(SYMBOL, mt5.TIMEFRAME_M5, s_dt_broker, e_dt_broker)
+        h1_rates = mt5.copy_rates_range(SYMBOL, mt5.TIMEFRAME_H1, s_dt_broker, e_dt_broker)
     finally:
         mt5.shutdown()
 

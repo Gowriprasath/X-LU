@@ -94,7 +94,7 @@ sys.path.append(os.path.join(PROJECT_ROOT, "Strategy"))
 sys.path.append(os.path.join(PROJECT_ROOT, "Memory"))
 sys.path.append(os.path.join(PROJECT_ROOT, "Integration"))
 sys.path.insert(0, PROJECT_ROOT)
-from paths import BACKTEST_TRACKER_PATH, MARKET_DATA_DIR as _MARKET_DIR, create_all_dirs as _create_all_dirs
+from paths import BACKTEST_TRACKER_PATH, MARKET_DATA_DIR as _MARKET_DIR, create_all_dirs as _create_all_dirs, TRADE_LOGS_DIR
 _create_all_dirs()
 sys.path.append(os.path.join(PROJECT_ROOT, "Integration", "Wisdom_Worker"))
 sys.path.append(os.path.join(PROJECT_ROOT, "Quant", "regime_detector"))
@@ -127,6 +127,51 @@ from news_history import (get_news_for_date, is_in_news_window,
 
 _spread_sim = SpreadSimulator()
 
+# ── Global Print Override to Prevent Console Flooding (Windows buffer hang safety) ──
+import builtins
+_original_print = builtins.print
+_in_final_report = False
+
+def quiet_print(*args, **kwargs):
+    global _in_final_report
+    if os.getenv("BACKTEST_VERBOSE") == "1" or _in_final_report:
+        _original_print(*args, **kwargs)
+        return
+
+    msg = " ".join(str(arg) for arg in args)
+    
+    # Allowed patterns that are critical for tracking progress or actual execution
+    allowed_substrings = [
+        "[Progress]",
+        "▶ TRADE",
+        "→ WIN",
+        "→ LOSS",
+        "→ TIMEOUT",
+        "Antigravity Bridge",
+        "BACKTEST COMPLETE",
+        "TEST SET RESULTS",
+        "[Start]",
+        "[Resume]",
+        "[Data]",
+        "[AI]",
+        "[PnLTracker]",
+        "Pre-calculating",
+        "Pre-calculation",
+        "ERROR",
+        "Error",
+        "WARNING:",
+        "ForceClose",
+        "Balance:",
+        "WR:",
+        "MaxDD:",
+        "PF:"
+    ]
+    
+    if any(sub in msg for sub in allowed_substrings):
+        _original_print(*args, **kwargs)
+
+builtins.print = quiet_print
+
 # XU-L meta-labelling layer
 try:
     import meta_labeller as ml
@@ -144,20 +189,25 @@ try:
 except ImportError:
     _PROFILER_ENABLED = False
 
+# ── Precomputed Features Cache for Vectorized Performance Boost ─────
+PRECOMPUTED_FEATURES_RAW = None
+PRECOMPUTED_FEATURES_Z   = None
+
 # ── Config ─────────────────────────────────────────────────────────
 # load_dotenv() called at the top of the file to fix import-order validation bug
 # Signal to risk_manager that this is a backtest run — suppresses per-candle
 # "Risk cleared" prints and skips MT5 calls (which hit every active candle).
-# Only use mock if no real AI key is available
+# Always set BACKTEST_MODE = "1" since we are executing the backtest engine.
 import os
+os.environ["BACKTEST_MODE"] = "1"
+
 _has_gemini = bool(os.getenv("GEMINI_API_KEY", "").strip())
 _has_claude = any(
     os.getenv(f"CLAUDE_API_KEY_{i}", "").strip()
     for i in range(1, 4)
 )
-if not _has_gemini and not _has_claude:
-    os.environ["BACKTEST_MODE"] = "1"
-    print("[Backtest] No AI keys found — running in mock mode.")
+if not _has_gemini and not _has_claude or os.getenv("BACKTEST_AI_MODE") == "mock":
+    print("[Backtest] Running in mock AI mode.")
 else:
     print("[Backtest] AI key found — running with real AI decisions.")
 
@@ -167,7 +217,7 @@ SYMBOL   = "XAUUSD"
 NY_TZ    = pytz.timezone('America/New_York')
 
 TRACKER_FILE      = BACKTEST_TRACKER_PATH
-SAVE_EVERY_N      = 50
+SAVE_EVERY_N      = 2000
 TICKET_PREFIX     = "BACKTEST_"
 H1_LOOKBACK       = 300
 MAGIC_NUMBER      = 99999
@@ -211,7 +261,53 @@ _active_trade = {
     "partial_cycle":    False,  # True for 1 cycle after partial → defer BE
     "spread_at_entry":  0.0,
     "regime_at_entry":  "",
+    "bars_open":        0,
 }
+
+_pending_order = {
+    "ticket":           None,
+    "type":             None,    # "BUY_LIMIT", "SELL_LIMIT", "BUY_STOP", "SELL_STOP"
+    "entry":            0.0,
+    "sl":               0.0,
+    "tp":               0.0,
+    "lot":              0.0,
+    "bars_held":        0,
+    "time":             None,
+    "session":          "",
+    "regime_at_entry":  "",
+    "_meta_result":     None,
+    "_dual_reason":     None,
+    "_norm_vol":        1.0,
+}
+
+def _reset_pending_order():
+    global _pending_order
+    _pending_order = {
+        "ticket":           None,
+        "type":             None,
+        "entry":            0.0,
+        "sl":               0.0,
+        "tp":               0.0,
+        "lot":              0.0,
+        "bars_held":        0,
+        "time":             None,
+        "session":          "",
+        "regime_at_entry":  "",
+        "_meta_result":     None,
+        "_dual_reason":     None,
+        "_norm_vol":        1.0,
+    }
+
+def _log_to_trade_file(ticket, current_time, message):
+    """Logs detailed operational telemetry for a specific trade ticket."""
+    try:
+        os.makedirs(TRADE_LOGS_DIR, exist_ok=True)
+        log_path = os.path.join(TRADE_LOGS_DIR, f"trade_{ticket}.log")
+        timestamp = current_time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"[{timestamp}] {message}\n")
+    except Exception as e:
+        print(f"Error writing to trade log for ticket {ticket}: {e}")
 
 # ── Backtest stats ─────────────────────────────────────────────────
 _stats = {
@@ -389,7 +485,7 @@ def calculate_pnl_dollars(pnl_pips, lot, contract_size=100):
 # ================================================================
 def validate_trade_logic(decision, current_price):
     signal = decision.get("signal", "WAIT").upper()
-    if signal not in ["BUY", "SELL"]:
+    if signal not in ["BUY", "SELL", "BUY_LIMIT", "SELL_LIMIT", "BUY_STOP", "SELL_STOP"]:
         return True
     entry = float(decision.get("entry", 0))
     sl    = float(decision.get("sl",    0))
@@ -404,9 +500,13 @@ def validate_trade_logic(decision, current_price):
     rr = abs(tp - entry) / sl_dist
     if rr < 1.5:
         return False
-    if signal == "BUY" and not (sl < entry < tp):
+    
+    is_buy_type = signal in ["BUY", "BUY_LIMIT", "BUY_STOP"]
+    is_sell_type = signal in ["SELL", "SELL_LIMIT", "SELL_STOP"]
+    
+    if is_buy_type and not (sl < entry < tp):
         return False
-    if signal == "SELL" and not (tp < entry < sl):
+    if is_sell_type and not (tp < entry < sl):
         return False
     return True
 
@@ -422,7 +522,7 @@ def _diagnose_trade_failure(decision, current_price):
     "levels"        — sl/tp/entry arrangement invalid
     """
     signal = decision.get("signal", "WAIT").upper()
-    if signal not in ["BUY", "SELL"]:
+    if signal not in ["BUY", "SELL", "BUY_LIMIT", "SELL_LIMIT", "BUY_STOP", "SELL_STOP"]:
         return "levels"
 
     entry = float(decision.get("entry", 0))
@@ -444,10 +544,13 @@ def _diagnose_trade_failure(decision, current_price):
     if rr < 1.5:
         return "rr"
 
+    is_buy_type = signal in ["BUY", "BUY_LIMIT", "BUY_STOP"]
+    is_sell_type = signal in ["SELL", "SELL_LIMIT", "SELL_STOP"]
+
     # Check price arrangement
-    if signal == "BUY" and not (sl < entry < tp):
+    if is_buy_type and not (sl < entry < tp):
         return "levels"
-    if signal == "SELL" and not (tp < entry < sl):
+    if is_sell_type and not (tp < entry < sl):
         return "levels"
 
     return "levels"  # fallback
@@ -456,12 +559,29 @@ def _diagnose_trade_failure(decision, current_price):
 # ================================================================
 # REGIME DETECTION (from historical H1 data slice)
 # ================================================================
-def get_regime_from_slice(m5_df, h1_df, h4_df, d1_df, current_idx):
+def get_regime_from_slice(m5_df, h1_df, h4_df, d1_df, current_idx, candle_idx=None):
     """
     Runs multi-TF regime detector using only candles up to current_idx.
     No lookahead — each TF only sees data confirmed before current_time.
     """
     try:
+        global PRECOMPUTED_FEATURES_RAW, PRECOMPUTED_FEATURES_Z
+        if PRECOMPUTED_FEATURES_RAW is not None:
+            if candle_idx is not None:
+                latest_raw = PRECOMPUTED_FEATURES_RAW.iloc[[candle_idx]]
+                latest_z = PRECOMPUTED_FEATURES_Z.iloc[[candle_idx]]
+            elif current_idx in PRECOMPUTED_FEATURES_RAW.index:
+                latest_raw = PRECOMPUTED_FEATURES_RAW.loc[[current_idx]]
+                latest_z = PRECOMPUTED_FEATURES_Z.loc[[current_idx]]
+            else:
+                return {"regime": "LOW_VOL_RANGE", "guidance": "", "confidence": None}, ""
+
+            result = rd.predict(
+                precomputed_raw=latest_raw,
+                precomputed_z=latest_z
+            )
+            return result, rd.format_for_prompt(result)
+
         def past_slice(df, n):
             if df is None or df.empty:
                 return None
@@ -573,6 +693,8 @@ def check_simulated_postmortem(current_time, m5_df=None, h1_df=None):
     FIX B4: accepts m5_df + h1_df so MissWish can slice the day's candles
     from the already-loaded DataFrames instead of trying to connect to MT5.
     """
+    if os.getenv("BACKTEST_AI_MODE") == "mock":
+        return
     global _last_postmortem_date
     today = current_time.date()
     if (current_time.hour >= 17 and
@@ -594,6 +716,8 @@ _trading_day_count  = 0
 _last_wisdom_date   = None
 
 def check_simulated_wisdom(current_time):
+    if os.getenv("BACKTEST_AI_MODE") == "mock":
+        return
     global _trading_day_count, _last_wisdom_date
     today = current_time.date()
     if today != _last_wisdom_date and current_time.weekday() < 5:
@@ -627,6 +751,7 @@ def _reset_active_trade():
         "regime_at_entry":  "",
         "bars_open":        0,   # GAP-04 FIX: candle counter for trade timeout
     }
+    _reset_pending_order()
 
 
 # ================================================================
@@ -684,6 +809,11 @@ def _bt_manage_trade(current_candle: dict, current_time, m5_df, candle_idx: int,
     _active_trade["bars_open"] = _active_trade.get("bars_open", 0) + 1
     if _active_trade["bars_open"] >= MAX_BARS_OPEN:
         close_px_timeout = float(current_candle["close"])
+        _log_to_trade_file(
+            _active_trade["ticket"],
+            current_time,
+            f"[Mgmt/Timeout] Trade open for {_active_trade['bars_open']} candles (exceeds {MAX_BARS_OPEN} cap). Initiating market close."
+        )
         _force_close_trade(current_time, close_px_timeout,
                            f"Timeout: trade open {_active_trade['bars_open']} candles (>{MAX_BARS_OPEN})")
         return f"TIMEOUT after {MAX_BARS_OPEN} bars"
@@ -706,6 +836,14 @@ def _bt_manage_trade(current_candle: dict, current_time, m5_df, candle_idx: int,
     profit_dist = (close_px - entry) if direction == "BUY" else (entry - close_px)
     profit_r    = profit_dist / risk
 
+    # Log holding status every 12 bars (1 hour)
+    if _active_trade["bars_open"] % 12 == 0:
+        _log_to_trade_file(
+            _active_trade["ticket"],
+            current_time,
+            f"[HoldingStatus] Trade open for {_active_trade['bars_open']} candles. Current Price: {close_px:.2f}, Floating profit: {profit_dist:.2f} ({profit_r:.2f}R). SL: {sl:.2f}, TP: {tp:.2f}."
+        )
+
     # ── HYBRID DISPATCH ─────────────────────────────────────────────
     if regime_result:
         regime = regime_result.get("regime", "")
@@ -713,6 +851,11 @@ def _bt_manage_trade(current_candle: dict, current_time, m5_df, candle_idx: int,
 
         # 1. REVERSAL — immediate full close (D-05 FIX)
         if regime == "REVERSAL" and conf >= _BT_REVERSAL_THRESHOLD:
+            _log_to_trade_file(
+                _active_trade["ticket"],
+                current_time,
+                f"[Mgmt/Reversal] High-confidence REVERSAL regime detected ({conf:.0%} >= {_BT_REVERSAL_THRESHOLD:.0%}). Closing entire position."
+            )
             _force_close_trade(current_time, close_px,
                                f"REVERSAL {conf:.0%} (hybrid)", spread=spread)
             return f"REVERSAL_CLOSE ({conf:.0%})"
@@ -725,6 +868,11 @@ def _bt_manage_trade(current_candle: dict, current_time, m5_df, candle_idx: int,
                     recent_low = float(candles_slice["low"].min())
                     cand_sl    = round(recent_low - _BT_AGGRESSIVE_BUFFER, 2)
                     if cand_sl > sl:
+                        _log_to_trade_file(
+                            _active_trade["ticket"],
+                            current_time,
+                            f"[Mgmt/TrailAggressive] Trailed BUY Stop Loss from {sl:.2f} to {cand_sl:.2f} (recent low: {recent_low:.2f} - buffer: {_BT_AGGRESSIVE_BUFFER:.2f}) under high-confidence TREND regime: {regime} ({conf:.0%})."
+                        )
                         _active_trade["sl"]               = cand_sl
                         _active_trade["management_stage"] = 2
                         return f"TRAIL_AGGRESSIVE BUY SL→{cand_sl:.2f}"
@@ -732,6 +880,11 @@ def _bt_manage_trade(current_candle: dict, current_time, m5_df, candle_idx: int,
                     recent_high = float(candles_slice["high"].max())
                     cand_sl     = round(recent_high + _BT_AGGRESSIVE_BUFFER, 2)
                     if cand_sl < sl:
+                        _log_to_trade_file(
+                            _active_trade["ticket"],
+                            current_time,
+                            f"[Mgmt/TrailAggressive] Trailed SELL Stop Loss from {sl:.2f} to {cand_sl:.2f} (recent high: {recent_high:.2f} + buffer: {_BT_AGGRESSIVE_BUFFER:.2f}) under high-confidence TREND regime: {regime} ({conf:.0%})."
+                        )
                         _active_trade["sl"]               = cand_sl
                         _active_trade["management_stage"] = 2
                         return f"TRAIL_AGGRESSIVE SELL SL→{cand_sl:.2f}"
@@ -739,6 +892,11 @@ def _bt_manage_trade(current_candle: dict, current_time, m5_df, candle_idx: int,
         # SKIP_PARTIAL: in TREND with high conf, skip the 50% close at 1R
         if regime in _BT_TREND_REGIMES and conf > _BT_TREND_THRESHOLD and stage == 0:
             if profit_r >= 1.0 and not partial_taken:
+                _log_to_trade_file(
+                    _active_trade["ticket"],
+                    current_time,
+                    f"[Mgmt/SkipPartial] Profit reached {profit_r:.2f}R >= 1R. Skipping mechanical partial close because market is in strong TREND regime: {regime} ({conf:.0%})."
+                )
                 _active_trade["partial_taken"] = True  # mark taken without closing
                 return f"SKIP_PARTIAL ({regime} {conf:.0%}) — full position held"
 
@@ -753,6 +911,11 @@ def _bt_manage_trade(current_candle: dict, current_time, m5_df, candle_idx: int,
                 raw_p       = abs(p_price - entry)
                 p_pips      = SpreadSimulator.apply_spread_cost(raw_p, spread)
                 p_pnl       = calculate_pnl_dollars(p_pips, partial_lot)
+                _log_to_trade_file(
+                    _active_trade["ticket"],
+                    current_time,
+                    f"[Mgmt/Partial75] 0.75R target reached in compression regime ({regime}). Partially closed 75% of remaining position. Closed: {partial_lot} lot, Banked PnL: ${p_pnl:+.2f}. Remaining lot size: {round(rem_lot - partial_lot, 2)}."
+                )
                 _active_trade["partial_taken"]  = True
                 _active_trade["partial_pnl"]   += p_pnl
                 _active_trade["remaining_lot"]  = round(rem_lot - partial_lot, 2)
@@ -762,6 +925,11 @@ def _bt_manage_trade(current_candle: dict, current_time, m5_df, candle_idx: int,
 
             if profit_r >= _BT_COMPRESSION_BE_R:
                 # Early break-even
+                _log_to_trade_file(
+                    _active_trade["ticket"],
+                    current_time,
+                    f"[Mgmt/TightBE] 0.5R reached in compression regime ({regime}). Moving Stop Loss to entry {entry:.2f}."
+                )
                 _active_trade["sl"]               = entry
                 _active_trade["management_stage"] = 1
                 return f"TIGHT_BE ({regime}) SL→{entry:.2f}"
@@ -781,6 +949,11 @@ def _bt_manage_trade(current_candle: dict, current_time, m5_df, candle_idx: int,
             raw_p       = abs(p_price - entry)
             p_pips      = SpreadSimulator.apply_spread_cost(raw_p, spread)
             p_pnl       = calculate_pnl_dollars(p_pips, partial_lot)
+            _log_to_trade_file(
+                _active_trade["ticket"],
+                current_time,
+                f"[Mgmt/1RPartial] Mechanical 1R hit! Partially closing 50% of remaining position. Closed: {partial_lot} lot, Banked PnL: ${p_pnl:+.2f}. Remaining lot size: {round(rem_lot - partial_lot, 2)}."
+            )
             _active_trade["partial_taken"]  = True
             _active_trade["partial_pnl"]   += p_pnl
             _active_trade["remaining_lot"]  = round(rem_lot - partial_lot, 2)
@@ -792,6 +965,11 @@ def _bt_manage_trade(current_candle: dict, current_time, m5_df, candle_idx: int,
 
         # --- Deferred BE: fires the cycle after partial ---
         if _active_trade.get("partial_cycle"):
+            _log_to_trade_file(
+                _active_trade["ticket"],
+                current_time,
+                f"[Mgmt/BE_Set] Deferred break-even Stop Loss set to entry {entry:.2f}."
+            )
             _active_trade["sl"]               = entry
             _active_trade["management_stage"] = 1
             _active_trade["partial_cycle"]    = False
@@ -808,6 +986,11 @@ def _bt_manage_trade(current_candle: dict, current_time, m5_df, candle_idx: int,
             recent_low = float(candles_slice["low"].min())
             cand_sl    = round(recent_low - _BT_DEFAULT_BUFFER, 2)
             if cand_sl > sl:
+                _log_to_trade_file(
+                    _active_trade["ticket"],
+                    current_time,
+                    f"[Mgmt/TrailNormal] Trailed Stop Loss to {cand_sl:.2f} (recent low: {recent_low:.2f} - buffer: {_BT_DEFAULT_BUFFER:.2f})."
+                )
                 _active_trade["sl"]               = cand_sl
                 _active_trade["management_stage"] = 2
                 return f"TRAIL BUY SL→{cand_sl:.2f}"
@@ -815,6 +998,11 @@ def _bt_manage_trade(current_candle: dict, current_time, m5_df, candle_idx: int,
             recent_high = float(candles_slice["high"].max())
             cand_sl     = round(recent_high + _BT_DEFAULT_BUFFER, 2)
             if cand_sl < sl:
+                _log_to_trade_file(
+                    _active_trade["ticket"],
+                    current_time,
+                    f"[Mgmt/TrailNormal] Trailed Stop Loss to {cand_sl:.2f} (recent high: {recent_high:.2f} + buffer: {_BT_DEFAULT_BUFFER:.2f})."
+                )
                 _active_trade["sl"]               = cand_sl
                 _active_trade["management_stage"] = 2
                 return f"TRAIL SELL SL→{cand_sl:.2f}"
@@ -935,13 +1123,35 @@ def run_backtest(date_from=None, date_to=None, resume=False):
     total_candles = len(m5_df)
     tracker["total_candles"] = total_candles
     print(f"[Start] {total_candles - start_idx:,} candles to process")
-    print(f"[AI]    Provider: {AI_DISPLAY_NAME} ({AI_MODEL})\n")
+    # Dynamic display of active backtest AI provider
+    bt_mode = os.getenv("BACKTEST_AI_MODE", "mock").lower()
+    bt_provider = os.getenv("BACKTEST_AI_PROVIDER", "mock").upper() if bt_mode == "real" else "MOCK"
+    if bt_mode == "real":
+        print(f"[AI]    Provider: {bt_provider} (Mode: REAL/LIVE PIPELINE)\n")
+    else:
+        print(f"[AI]    Provider: {AI_DISPLAY_NAME} ({AI_MODEL}) [MOCK GENERATOR]\n")
 
     _NY_TZ = pytz.timezone("America/New_York")
     date_from_aware = (
         _NY_TZ.localize(date_from) if (date_from is not None and date_from.tzinfo is None)
         else date_from
     )
+
+    # ── Pre-calculate technical features vectorially to bypass dynamic O(N^2) bottleneck ──
+    global PRECOMPUTED_FEATURES_RAW, PRECOMPUTED_FEATURES_Z
+    print("[Backtest] Pre-calculating all technical features vectorially to bypass dynamic O(N^2) bottleneck...")
+    import time
+    t0 = time.time()
+    try:
+        from feature_engineer import build_multi_tf_features, apply_rolling_zscore, TF_FEATURE_COLS
+        PRECOMPUTED_FEATURES_RAW = build_multi_tf_features(m5_df, h1_df, h4_df, d1_df)
+        tf_cols = [c for c in TF_FEATURE_COLS if c in PRECOMPUTED_FEATURES_RAW.columns]
+        PRECOMPUTED_FEATURES_Z = apply_rolling_zscore(PRECOMPUTED_FEATURES_RAW, cols=tf_cols, window=500).fillna(0.0)
+        print(f"[Backtest] Pre-calculation complete in {time.time() - t0:.2f}s! Vectorized feature cache is active.")
+    except Exception as fe_err:
+        print(f"[Backtest] Pre-calculation failed: {fe_err}. Falling back to dynamic bar-by-bar extraction.")
+        PRECOMPUTED_FEATURES_RAW = None
+        PRECOMPUTED_FEATURES_Z = None
 
     # ── Main candle loop ───────────────────────────────────────────
     candle_idx = start_idx
@@ -960,7 +1170,7 @@ def run_backtest(date_from=None, date_to=None, resume=False):
         if not session:
             if _active_trade["ticket"]:
                 # Overnight regime guard
-                _run_overnight_guard(current_time, m5_df, h1_df, h4_df, d1_df, current_candle)
+                _run_overnight_guard(current_time, m5_df, h1_df, h4_df, d1_df, current_candle, candle_idx=candle_idx)
             else:
                 _stats["skipped_dead_zone"] += 1
             _save_progress_if_needed(tracker, candle_idx, current_time)
@@ -976,6 +1186,111 @@ def run_backtest(date_from=None, date_to=None, resume=False):
                 _save_progress_if_needed(tracker, candle_idx, current_time)
                 candle_idx += 1
                 continue
+
+        # ── Pending order handling ──────────────────────────────
+        if _pending_order["ticket"] and not _active_trade["ticket"]:
+            # Increment bars held
+            _pending_order["bars_held"] += 1
+            
+            high_px = float(current_candle["high"])
+            low_px = float(current_candle["low"])
+            entry_px = _pending_order["entry"]
+            ord_type = _pending_order["type"]
+            ticket = _pending_order["ticket"]
+            
+            triggered = False
+            if ord_type == "BUY_LIMIT" and low_px <= entry_px:
+                triggered = True
+            elif ord_type == "SELL_LIMIT" and high_px >= entry_px:
+                triggered = True
+            elif ord_type == "BUY_STOP" and high_px >= entry_px:
+                triggered = True
+            elif ord_type == "SELL_STOP" and low_px <= entry_px:
+                triggered = True
+                
+            if triggered:
+                # Triggered/filled!
+                # Simulate spread and slippage cost
+                trade_spread = float(current_candle.get("spread", 0.15))
+                # Add news-spike spread widening
+                news_today = get_news_for_date(current_time.date())
+                news_widened = False
+                if news_today:
+                    for ev in news_today:
+                        if ev.get("impact", "").upper() == "HIGH" and ev.get("time"):
+                            diff = abs((ev["time"] - current_time).total_seconds()) / 60
+                            if diff <= 10:
+                                trade_spread = max(trade_spread, 1.50)
+                                news_widened = True
+                                break
+                
+                import random
+                trade_slippage = round(random.uniform(0.02, 0.15), 2)
+                if news_widened:
+                    trade_slippage = round(random.uniform(0.30, 0.80), 2)
+                
+                spread_cost_usd = 0.0
+                slippage_cost_usd = 0.0
+                filled_entry = entry_px
+                
+                if ord_type in ["BUY_LIMIT", "BUY_STOP"]:
+                    filled_entry = entry_px + trade_spread + trade_slippage
+                    spread_cost_usd = trade_spread * _pending_order["lot"] * 100
+                    slippage_cost_usd = trade_slippage * _pending_order["lot"] * 100
+                else:
+                    filled_entry = entry_px - trade_slippage
+                    spread_cost_usd = trade_spread * _pending_order["lot"] * 100
+                    slippage_cost_usd = trade_slippage * _pending_order["lot"] * 100
+                
+                _stats["total_spread_cost"] += spread_cost_usd
+                _stats["total_slippage_cost"] += slippage_cost_usd
+                
+                _active_trade.update({
+                    "ticket":           ticket,
+                    "type":             "BUY" if ord_type in ["BUY_LIMIT", "BUY_STOP"] else "SELL",
+                    "entry":            filled_entry,
+                    "sl":               _pending_order["sl"],
+                    "tp":               _pending_order["tp"],
+                    "lot":              _pending_order["lot"],
+                    "remaining_lot":    _pending_order["lot"],
+                    "management_stage": 0,
+                    "partial_taken":    False,
+                    "partial_pnl":      0.0,
+                    "partial_cycle":    False,
+                    "spread_at_entry":  trade_spread,
+                    "regime_at_entry":  _pending_order["regime_at_entry"],
+                    "bars_open":        0,
+                    "_meta_result":     _pending_order["_meta_result"],
+                    "_dual_reason":     _pending_order["_dual_reason"],
+                    "_norm_vol":        _pending_order.get("_norm_vol", 1.0)
+                })
+                
+                _stats["total_trades"] += 1
+                
+                # Detailed Trade Open/Trigger Log
+                log_msg = (
+                    f"=== PENDING ORDER TRIGGERED/FILLED: #{ticket} ({ord_type} -> {_active_trade['type']}) ===\n"
+                    f"  Trigger Time: {current_time}\n"
+                    f"  Session: {session}\n"
+                    f"  Order Price: {entry_px:.2f} | Filled Entry Price: {filled_entry:.2f}\n"
+                    f"  Spread: ${trade_spread:.2f} | Slippage: ${trade_slippage:.2f} | Drag: -${spread_cost_usd + slippage_cost_usd:.2f}\n"
+                    f"  SL: {_active_trade['sl']:.2f} | TP: {_active_trade['tp']:.2f}\n"
+                    f"  HMM Regime: {_active_trade['regime_at_entry']} | Meta/Dual router confirmed at placement."
+                )
+                _log_to_trade_file(ticket, current_time, log_msg)
+                
+                _reset_pending_order()
+                
+            elif _pending_order["bars_held"] >= 288:
+                log_msg = (
+                    f"=== PENDING ORDER EXPIRED: #{ticket} ({ord_type}) ===\n"
+                    f"  Expiration Time: {current_time}\n"
+                    f"  Placed Time: {_pending_order['time']}\n"
+                    f"  Bars Held: {_pending_order['bars_held']} candles (>= 288 cap, 24 hours).\n"
+                    f"  Order Price: {entry_px:.2f} was not reached."
+                )
+                _log_to_trade_file(ticket, current_time, log_msg)
+                _reset_pending_order()
 
         # GAP-01 FIX: open-position news partial close — mirrors live bot's
         # check_open_position_news_rule(). If high-impact news is 2–7 min away
@@ -1008,6 +1323,13 @@ def run_backtest(date_from=None, date_to=None, resume=False):
                                     _stats["total_pnl"] += _p_pnl
                                     print(f"  [NewsPartialClose] {current_time.strftime('%H:%M')} "
                                           f"HI news in {_diff:.0f}min — closed {_p_lot}L PnL:${_p_pnl:+.2f}")
+                                    _log_to_trade_file(
+                                        _active_trade["ticket"],
+                                        current_time,
+                                        f"[NewsPartialClose] High-impact news '{_ev.get('name', 'UNKNOWN')}' in {_diff:.0f} mins. "
+                                        f"Partially closing 50% of remaining position. Closed: {_p_lot} lot, Banked PnL: ${_p_pnl:+.2f}. "
+                                        f"Remaining Position Lot: {_active_trade['remaining_lot']}"
+                                    )
                             break
                     except Exception:
                         continue
@@ -1017,7 +1339,7 @@ def run_backtest(date_from=None, date_to=None, resume=False):
         # Regime detection runs before management so hybrid dispatch has context.
         # Skips AI entry logic entirely when a trade is open (D-10 intentional gap).
         if _active_trade["ticket"]:
-            _mgmt_regime, _ = get_regime_from_slice(m5_df, h1_df, h4_df, d1_df, current_time)
+            _mgmt_regime, _ = get_regime_from_slice(m5_df, h1_df, h4_df, d1_df, current_time, candle_idx=candle_idx)
             mgmt_action = _bt_manage_trade(
                 current_candle=current_candle.to_dict(),
                 current_time=current_time,
@@ -1025,7 +1347,7 @@ def run_backtest(date_from=None, date_to=None, resume=False):
                 candle_idx=candle_idx,
                 regime_result=_mgmt_regime,
             )
-            if mgmt_action:
+            if mgmt_action and not mgmt_action.startswith("WATCHING"):
                 print(f"  [BT_Mgmt/{current_time.strftime('%H:%M')}] {mgmt_action}")
             # If REVERSAL_CLOSE fired inside _bt_manage_trade, trade is now closed.
             # Check again — if still open, skip AI and move to next candle.
@@ -1068,7 +1390,7 @@ def run_backtest(date_from=None, date_to=None, resume=False):
             continue
 
         # Regime detection
-        regime_result, regime_context = get_regime_from_slice(m5_df, h1_df, h4_df, d1_df, current_time)
+        regime_result, regime_context = get_regime_from_slice(m5_df, h1_df, h4_df, d1_df, current_time, candle_idx=candle_idx)
 
         # ── Enrich with session-timing intelligence ───────────────
         if _PROFILER_ENABLED:
@@ -1077,7 +1399,7 @@ def run_backtest(date_from=None, date_to=None, resume=False):
                 # vol_ratio_20_100 / atr_percentile features.
                 # compute_norm_vol() with no args always returns 1.0 (hardcoded
                 # fallback) — vol adjustments on adaptive thresholds never fired.
-                _m5_slice_vol = m5_df[m5_df.index <= current_time].tail(120)
+                _m5_slice_vol = m5_df.iloc[max(0, candle_idx - 119) : candle_idx + 1]
                 regime_result = enrich_regime_result(
                     regime_result, session, signal=None,
                     norm_vol=compute_norm_vol(m5_df=_m5_slice_vol))
@@ -1098,105 +1420,114 @@ def run_backtest(date_from=None, date_to=None, resume=False):
             continue
 
         # Build market context
-        market_context, current_price = build_market_context(
-            m5_df, h1_df, h4_df, d1_df, current_time)
+        current_price = float(current_candle['close'])
+        if os.environ.get("BACKTEST_MODE") == "1":
+            prompt = (
+                f"Simulated Time: {current_time.strftime('%Y-%m-%d %H:%M')}\n"
+                f"Current Price: {current_price:.2f}\n"
+                f"Current session: {session}\n"
+                f"Regime: {regime_result.get('regime', 'LOW_VOL_RANGE')}"
+            )
+        else:
+            market_context, current_price = build_market_context(
+                m5_df, h1_df, h4_df, d1_df, current_time)
 
-        # ── News block — real historical events, identical format to live bot ──
-        news_block = format_news_for_prompt(news_today, current_time)
+            # ── News block — real historical events, identical format to live bot ──
+            news_block = format_news_for_prompt(news_today, current_time)
 
-        # Build prompt (identical to live bot)
-        past_lessons    = get_full_memory_context(market_context, current_time=current_time)
-        current_state   = thought_logger.get_current_state()
-        logic_framework = strategy_logic.get_analytical_framework()
-        execution_rules = strategy_rules.get_execution_rules()
+            # Build prompt (identical to live bot)
+            past_lessons    = get_full_memory_context(market_context, current_time=current_time)
+            current_state   = thought_logger.get_current_state()
+            logic_framework = strategy_logic.get_analytical_framework()
+            execution_rules = strategy_rules.get_execution_rules()
 
-        # Session timing block (non-empty once session_profiler has profiles built)
-        session_timing_block = ""
-        if _PROFILER_ENABLED:
+            # Session timing block (non-empty once session_profiler has profiles built)
+            session_timing_block = ""
+            if _PROFILER_ENABLED:
+                try:
+                    session_timing_block = format_session_profile_for_prompt(regime_result)
+                except Exception:
+                    pass
+
+            # HMM transition forecast — same block as live bot
+            transition_forecast_block = ""
             try:
-                session_timing_block = format_session_profile_for_prompt(regime_result)
+                transition_forecast_block = rd.format_transition_forecast_for_prompt(regime_result)
             except Exception:
                 pass
 
-        # HMM transition forecast — same block as live bot
-        transition_forecast_block = ""
-        try:
-            transition_forecast_block = rd.format_transition_forecast_for_prompt(regime_result)
-        except Exception:
-            pass
+            # XGBoost signal quality — same block as live bot
+            signal_quality_block = ""
+            try:
+                signal_quality_block = rd.format_model_signal_quality_for_prompt(regime_result)
+            except Exception:
+                pass
 
-        # XGBoost signal quality — same block as live bot
-        signal_quality_block = ""
-        try:
-            signal_quality_block = rd.format_model_signal_quality_for_prompt(regime_result)
-        except Exception:
-            pass
-
-        # Regime router guidance block
-        # GAP-03 FIX: call format_gate_context with same 3-arg signature as main_bot.py
-        # Previous call passed 2-tuple (gate_result only) — live bot passes (allowed, reason, size_mult).
-        router_block = ""
-        try:
-            gate_result  = rr.check_confidence_gate(regime_result)
-            gate_allowed = gate_result[0] if isinstance(gate_result, (tuple, list)) else bool(gate_result)
-            gate_reason  = gate_result[1] if isinstance(gate_result, (tuple, list)) and len(gate_result) > 1 else ""
-            router_block = rr.format_gate_context(
-                regime_result,
-                (gate_allowed, gate_reason, 1.0),   # size_mult placeholder — matches main_bot.py
-                None
-            )
-        except Exception:
+            # Regime router guidance block
+            # GAP-03 FIX: call format_gate_context with same 3-arg signature as main_bot.py
+            # Previous call passed 2-tuple (gate_result only) — live bot passes (allowed, reason, size_mult).
             router_block = ""
+            try:
+                gate_result  = rr.check_confidence_gate(regime_result)
+                gate_allowed = gate_result[0] if isinstance(gate_result, (tuple, list)) else bool(gate_result)
+                gate_reason  = gate_result[1] if isinstance(gate_result, (tuple, list)) and len(gate_result) > 1 else ""
+                router_block = rr.format_gate_context(
+                    regime_result,
+                    (gate_allowed, gate_reason, 1.0),   # size_mult placeholder — matches main_bot.py
+                    None
+                )
+            except Exception:
+                router_block = ""
 
-        prompt = f"""
-        You are a Multi-Disciplinary Gold Trader with a continuous memory.
-        NOTE: This is a BACKTEST simulation. Simulated time: {current_time.strftime('%Y-%m-%d %H:%M %Z')}
+            prompt = f"""
+            You are a Multi-Disciplinary Gold Trader with a continuous memory.
+            NOTE: This is a BACKTEST simulation. Simulated time: {current_time.strftime('%Y-%m-%d %H:%M %Z')}
 
-        --- YOUR PREVIOUS INTERNAL MONOLOGUE ---
-        Your last bias was: {current_state.get('current_bias', 'NEUTRAL')}
-        Your ongoing thesis was: {current_state.get('active_thesis', 'Searching for setup.')}
+            --- YOUR PREVIOUS INTERNAL MONOLOGUE ---
+            Your last bias was: {current_state.get('current_bias', 'NEUTRAL')}
+            Your ongoing thesis was: {current_state.get('active_thesis', 'Searching for setup.')}
 
-        --- MACROECONOMIC NEWS TODAY ---
-        {news_block}
+            --- MACROECONOMIC NEWS TODAY ---
+            {news_block}
 
-        --- LIVE CALENDAR ---
-        Today is strictly: {current_time.strftime("%A")}
-        Current session: {session}
+            --- LIVE CALENDAR ---
+            Today is strictly: {current_time.strftime("%A")}
+            Current session: {session}
 
-        --- REGIME DETECTOR ---
-        {regime_context}
+            --- REGIME DETECTOR ---
+            {regime_context}
 
-        --- REGIME ROUTER ---
-        {router_block}
+            --- REGIME ROUTER ---
+            {router_block}
 
-        --- SESSION TIMING INTELLIGENCE ---
-        {session_timing_block if session_timing_block else "[Session profiles not yet built — will populate after first training run]"}
+            --- SESSION TIMING INTELLIGENCE ---
+            {session_timing_block if session_timing_block else "[Session profiles not yet built — will populate after first training run]"}
 
-        --- HMM TRANSITION FORECAST (WHAT TYPICALLY COMES NEXT) ---
-        {transition_forecast_block if transition_forecast_block else "[Transition forecast unavailable — model not trained yet]"}
+            --- HMM TRANSITION FORECAST (WHAT TYPICALLY COMES NEXT) ---
+            {transition_forecast_block if transition_forecast_block else "[Transition forecast unavailable — model not trained yet]"}
 
-        --- MODEL SIGNAL QUALITY (HOW CONFIDENT THE MODEL IS) ---
-        {signal_quality_block if signal_quality_block else "[Signal quality unavailable — model not trained yet]"}
+            --- MODEL SIGNAL QUALITY (HOW CONFIDENT THE MODEL IS) ---
+            {signal_quality_block if signal_quality_block else "[Signal quality unavailable — model not trained yet]"}
 
-        --- MARKET DATA ---
-        {market_context}
+            --- MARKET DATA ---
+            {market_context}
 
-        --- ANALYTICAL FRAMEWORK (HOW TO THINK) ---
-        {logic_framework}
+            --- ANALYTICAL FRAMEWORK (HOW TO THINK) ---
+            {logic_framework}
 
-        --- EXECUTION RULES (WHEN TO TRADE) ---
-        {execution_rules}
+            --- EXECUTION RULES (WHEN TO TRADE) ---
+            {execution_rules}
 
-        --- HISTORICAL LESSONS & HINDSIGHT ---
-        {past_lessons}
+            --- HISTORICAL LESSONS & HINDSIGHT ---
+            {past_lessons}
 
-        --- TASK ---
-        1. Analyze the market using ICT, Classic TA, and Elliott Wave.
-        2. Calculate the Confluence Score (0-3).
-        3. Decide: BUY, SELL, WAIT, HOLD, or CLOSE.
-        4. If a trade signal, provide entry, sl, tp.
-        5. Output ONLY valid JSON as specified in the execution rules.
-        """
+            --- TASK ---
+            1. Analyze the market using ICT, Classic TA, and Elliott Wave.
+            2. Calculate the Confluence Score (0-3).
+            3. Decide: BUY, SELL, WAIT, HOLD, or CLOSE.
+            4. If a trade signal, provide entry, sl, tp.
+            5. Output ONLY valid JSON as specified in the execution rules.
+            """
 
         # ── Call AI (D-01 FIX: Claude Sonnet via call_ai, same as live) ─
         decision = {}
@@ -1218,12 +1549,16 @@ def run_backtest(date_from=None, date_to=None, resume=False):
             _stats["api_calls"] += 1
         except Exception as e:
             print(f"[AI] Error at {current_time}: {e}")
+            try:
+                print(f"[AI] Raw text was: {repr(raw_text)}")
+            except Exception:
+                pass
             _save_progress_if_needed(tracker, candle_idx, current_time)
             candle_idx += 1  # FIX: must increment before continue or loop is infinite
             continue
 
         signal = decision.get("signal", "WAIT").upper()
-        if signal not in ["BUY", "SELL", "WAIT", "HOLD", "CLOSE"]:
+        if signal not in ["BUY", "SELL", "BUY_LIMIT", "SELL_LIMIT", "BUY_STOP", "SELL_STOP", "WAIT", "HOLD", "CLOSE"]:
             signal = "WAIT"
 
         # ── Count Claude WAIT ─────────────────────────────
@@ -1231,10 +1566,11 @@ def run_backtest(date_from=None, date_to=None, resume=False):
             _stats["claude_wait_blocked"] += 1
 
         # Print cycle summary
-        print(f"[{current_time.strftime('%Y-%m-%d %H:%M')}] {session:6s} | "
-              f"{signal:5s} | Score: {decision.get('confluence_score', '?')} | "
-              f"Trades: {_stats['total_trades']} | "
-              f"PnL: ${_stats['total_pnl']:+.0f}")
+        if signal not in ("WAIT", "HOLD") or os.environ.get("BACKTEST_MODE") != "1":
+            print(f"[{current_time.strftime('%Y-%m-%d %H:%M')}] {session:6s} | "
+                  f"{signal:5s} | Score: {decision.get('confluence_score', '?')} | "
+                  f"Trades: {_stats['total_trades']} | "
+                  f"PnL: ${_stats['total_pnl']:+.0f}")
 
         # ── CLOSE ───────────────────────────────────────────────
         if signal == "CLOSE" and _active_trade["ticket"]:
@@ -1243,8 +1579,8 @@ def run_backtest(date_from=None, date_to=None, resume=False):
                 f"AI reversal signal at {current_time.strftime('%Y-%m-%d %H:%M')}"
             )
 
-        # ── BUY / SELL ──────────────────────────────────────────
-        elif signal in ["BUY", "SELL"] and not _active_trade["ticket"]:
+        # ── BUY / SELL / PENDING ORDERS ──────────────────────────
+        elif signal in ["BUY", "SELL", "BUY_LIMIT", "SELL_LIMIT", "BUY_STOP", "SELL_STOP"] and not _active_trade["ticket"]:
 
             # London gate — Rule 1a
             if session == "London" and decision.get("confluence_score", 0) < 3:
@@ -1301,8 +1637,12 @@ def run_backtest(date_from=None, date_to=None, resume=False):
 
                     if _META_ENABLED:
                         try:
-                            # Build minimal market_features for meta model
-                            mf_slice = m5_df[m5_df.index <= current_time].tail(100)
+                            # Use precomputed features if available, otherwise fall back to raw slice
+                            if PRECOMPUTED_FEATURES_RAW is not None and current_time in PRECOMPUTED_FEATURES_RAW.index:
+                                mf_slice = PRECOMPUTED_FEATURES_RAW.loc[[current_time]]
+                            else:
+                                mf_slice = m5_df.iloc[max(0, candle_idx - 99) : candle_idx + 1]
+
                             primary_signal = {
                                 "signal":           signal,
                                 "regime":           regime_result.get("regime", "UNKNOWN"),
@@ -1384,57 +1724,106 @@ def run_backtest(date_from=None, date_to=None, resume=False):
                                 continue
 
                             ticket = f"{TICKET_PREFIX}{current_time.strftime('%Y%m%d%H%M%S')}"
-                            _stats["total_trades"] += 1
 
-                            # ── Spread + Slippage: realistic fill model ───────────────
-                            # Spread   = broker bid-ask gap (always paid, session + news-spike aware)
-                            # Slippage = extra adverse fill beyond quoted price (market impact)
-                            # Both always move against the trade; slippage is 0.3–1.5 pts normally,
-                            # up to 3 pts during news — the single largest source of live vs backtest gap.
-                            trade_spread    = _pre_spread   # reuse the gate check value (same candle)
-                            trade_slippage  = _spread_sim.get_slippage(session, current_time, news_today)
-                            filled_entry    = _spread_sim.adjusted_entry(
-                                                  signal, entry, trade_spread, trade_slippage)
-                            spread_cost_usd   = trade_spread   * lot * 100
-                            slippage_cost_usd = trade_slippage * lot * 100
-                            _stats["total_spread_cost"]   += spread_cost_usd
-                            _stats["total_slippage_cost"] += slippage_cost_usd
+                            # If we already have an active pending order, cancel it first
+                            if _pending_order["ticket"]:
+                                log_msg = (
+                                    f"=== PENDING ORDER CANCELLED (REPLACED BY NEW SIGNAL): #{_pending_order['ticket']} ({_pending_order['type']}) ===\n"
+                                    f"  Cancellation Time: {current_time}\n"
+                                    f"  New Signal: {signal} #{ticket}"
+                                )
+                                _log_to_trade_file(_pending_order["ticket"], current_time, log_msg)
+                                _reset_pending_order()
 
-                            print(f"  ▶ TRADE #{ticket} | {signal} | "
-                                  f"Entry:{entry:.2f}→fill:{filled_entry:.2f} "
-                                  f"(slip:{trade_slippage:.2f}) "
-                                  f"SL:{sl:.2f} TP:{tp:.2f} | "
-                                  f"Lot:{lot} | Size:{final_size:.2f}x | "
-                                  f"Spread:${trade_spread:.2f} Slip:${trade_slippage:.2f} "
-                                  f"(-${spread_cost_usd + slippage_cost_usd:.2f} total drag)")
+                            if signal in ["BUY_LIMIT", "SELL_LIMIT", "BUY_STOP", "SELL_STOP"]:
+                                _pending_order.update({
+                                    "ticket":           ticket,
+                                    "type":             signal,
+                                    "entry":            entry,
+                                    "sl":               sl,
+                                    "tp":               tp,
+                                    "lot":              lot,
+                                    "bars_held":        0,
+                                    "time":             current_time,
+                                    "session":          session,
+                                    "regime_at_entry":  regime_result.get("regime", ""),
+                                    "_meta_result":     meta_result,
+                                    "_dual_reason":     dual_reason,
+                                    "_norm_vol":        regime_result.get("session_profile", {}).get("norm_vol", 1.0),
+                                })
+                                print(f"  [PendingOrder] Placed #{ticket} | {signal} | "
+                                      f"Entry Price: {entry:.2f} | SL: {sl:.2f} | TP: {tp:.2f} | Lot: {lot}")
+                                
+                                # Log pending order creation to the trade log
+                                log_msg = (
+                                    f"=== PENDING ORDER PLACED: #{ticket} ({signal}) ===\n"
+                                    f"  Time: {current_time}\n"
+                                    f"  Session: {session}\n"
+                                    f"  HMM Regime: {regime_result.get('regime', 'UNKNOWN')} (Confidence: {regime_result.get('confidence', 0.0):.2%})\n"
+                                    f"  Dual Router Reason: {dual_reason}\n"
+                                    f"  Meta Gate Prob: {meta_result.get('meta_prob', 0.0):.2f} (Threshold: {meta_result.get('threshold_used', 0.0):.2f}, Size Mult: {final_size:.2f}x)\n"
+                                    f"  Lot Size: {lot}\n"
+                                    f"  Order Entry Price: {entry:.2f}\n"
+                                    f"  SL: {sl:.2f} | TP: {tp:.2f}\n"
+                                    f"  AI Rationale: {decision.get('rationale', '')}"
+                                )
+                                _log_to_trade_file(ticket, current_time, log_msg)
+                            else:
+                                _stats["total_trades"] += 1
 
-                            # D-02/D-03/D-04 FIX: open trade in _active_trade.
-                            # simulate_trade_outcome() is REMOVED — management now
-                            # happens candle-by-candle via _bt_manage_trade(), which
-                            # fires partial close, break-even, trailing stop, and hybrid
-                            # dispatch (REVERSAL/TRAIL_AGGRESSIVE/SKIP_PARTIAL/TIGHT_BE)
-                            # identically to the live bot's every-5-min cycle.
-                            # Close is detected by _check_sl_tp_hit() on each candle.
-                            _active_trade.update({
-                                "ticket":           ticket,
-                                "type":             signal,
-                                "entry":            filled_entry,
-                                "sl":               sl,
-                                "tp":               tp,
-                                "lot":              lot,
-                                "remaining_lot":    lot,
-                                "management_stage": 0,
-                                "partial_taken":    False,
-                                "partial_pnl":      0.0,
-                                "partial_cycle":    False,
-                                "spread_at_entry":  trade_spread,
-                                "regime_at_entry":  regime_result.get("regime", ""),
-                                "bars_open":        0,   # GAP-04 FIX: timeout counter
-                                # Stash for meta wisdom lesson when trade closes
-                                "_meta_result":     meta_result,
-                                "_dual_reason":     dual_reason,
-                                "_norm_vol":        regime_result.get("session_profile", {}).get("norm_vol", 1.0),
-                            })
+                                # ── Spread + Slippage: realistic fill model ───────────────
+                                trade_spread    = _pre_spread
+                                trade_slippage  = _spread_sim.get_slippage(session, current_time, news_today)
+                                filled_entry    = _spread_sim.adjusted_entry(
+                                                      signal, entry, trade_spread, trade_slippage)
+                                spread_cost_usd   = trade_spread   * lot * 100
+                                slippage_cost_usd = trade_slippage * lot * 100
+                                _stats["total_spread_cost"]   += spread_cost_usd
+                                _stats["total_slippage_cost"] += slippage_cost_usd
+
+                                print(f"  ▶ TRADE #{ticket} | {signal} | "
+                                      f"Entry:{entry:.2f}→fill:{filled_entry:.2f} "
+                                      f"(slip:{trade_slippage:.2f}) "
+                                      f"SL:{sl:.2f} TP:{tp:.2f} | "
+                                      f"Lot:{lot} | Size:{final_size:.2f}x | "
+                                      f"Spread:${trade_spread:.2f} Slip:${trade_slippage:.2f} "
+                                      f"(-${spread_cost_usd + slippage_cost_usd:.2f} total drag)")
+
+                                _active_trade.update({
+                                    "ticket":           ticket,
+                                    "type":             signal,
+                                    "entry":            filled_entry,
+                                    "sl":               sl,
+                                    "tp":               tp,
+                                    "lot":              lot,
+                                    "remaining_lot":    lot,
+                                    "management_stage": 0,
+                                    "partial_taken":    False,
+                                    "partial_pnl":      0.0,
+                                    "partial_cycle":    False,
+                                    "spread_at_entry":  trade_spread,
+                                    "regime_at_entry":  regime_result.get("regime", ""),
+                                    "bars_open":        0,
+                                    "_meta_result":     meta_result,
+                                    "_dual_reason":     dual_reason,
+                                    "_norm_vol":        regime_result.get("session_profile", {}).get("norm_vol", 1.0),
+                                })
+
+                                # Detailed Trade Open Log
+                                log_msg = (
+                                    f"=== TRADE OPENED: #{ticket} ({signal}) ===\n"
+                                    f"  Time: {current_time}\n"
+                                    f"  Session: {session}\n"
+                                    f"  HMM Regime: {regime_result.get('regime', 'UNKNOWN')} (Confidence: {regime_result.get('confidence', 0.0):.2%})\n"
+                                    f"  Dual Router Reason: {dual_reason}\n"
+                                    f"  Meta Gate Prob: {meta_result.get('meta_prob', 0.0):.2f} (Threshold: {meta_result.get('threshold_used', 0.0):.2f}, Size Mult: {final_size:.2f}x)\n"
+                                    f"  Lot Size: {lot}\n"
+                                    f"  Raw Entry Price: {entry:.2f} | Filled Entry Price: {filled_entry:.2f}\n"
+                                    f"  Spread: ${trade_spread:.2f} | Slippage: ${trade_slippage:.2f} | Drag: -${spread_cost_usd + slippage_cost_usd:.2f}\n"
+                                    f"  Initial SL: {sl:.2f} | Initial TP: {tp:.2f}\n"
+                                    f"  AI Rationale: {decision.get('rationale', '')}"
+                                )
+                                _log_to_trade_file(ticket, current_time, log_msg)
 
                             # Log trade open to memory (outcome filled at close by _check_sl_tp_hit)
                             # BUG-03 FIX: removed signal_alignment= (not in log_trade signature —
@@ -1531,7 +1920,7 @@ def run_backtest(date_from=None, date_to=None, resume=False):
 # ================================================================
 # OVERNIGHT GUARD (backtest version — same logic, no MT5)
 # ================================================================
-def _run_overnight_guard(current_time, m5_df, h1_df, h4_df, d1_df, current_candle):
+def _run_overnight_guard(current_time, m5_df, h1_df, h4_df, d1_df, current_candle, candle_idx=None):
     """
     Regime guard for open trades in dead zones and off-session gaps — no API call.
     GAP-02 FIX: CLOSE_PARTIAL now implemented (was a 'no lot splitting yet' stub).
@@ -1543,7 +1932,7 @@ def _run_overnight_guard(current_time, m5_df, h1_df, h4_df, d1_df, current_candl
     if not _active_trade["ticket"]:
         return
 
-    regime_result, _ = get_regime_from_slice(m5_df, h1_df, h4_df, d1_df, current_time)
+    regime_result, _ = get_regime_from_slice(m5_df, h1_df, h4_df, d1_df, current_time, candle_idx=candle_idx)
     regime     = regime_result.get("regime", "LOW_VOL_RANGE")
     confidence = regime_result.get("confidence") or 0.0
     direction  = _active_trade["type"]
@@ -1651,6 +2040,20 @@ def _check_sl_tp_hit(candle, candle_time, m5_df, candle_idx):
               f"Partial:${partial_pnl:+.2f} + Remainder:${pnl_remainder:+.2f} "
               f"= Total:${total_pnl:+.2f}")
 
+        # Detailed Trade Close Log
+        log_msg = (
+            f"=== TRADE CLOSED: #{_active_trade['ticket']} ({hit} HIT) ===\n"
+            f"  Time: {candle_time}\n"
+            f"  Exit Price: {close_price:.2f}\n"
+            f"  Partial Banked PnL: ${partial_pnl:+.2f}\n"
+            f"  Remainder Closed PnL: ${pnl_remainder:+.2f}\n"
+            f"  Total PnL: ${total_pnl:+.2f}\n"
+            f"  Final Win/Loss Outcome: {final_result}\n"
+            f"  Commission/Swap Drag: -${spread * lot * 100:.2f}\n"
+            f"  Current Running Account Balance: {_stats['total_pnl'] + float(os.getenv('BACKTEST_INITIAL_BALANCE', '10000')):.2f}"
+        )
+        _log_to_trade_file(_active_trade["ticket"], candle_time, log_msg)
+
         memory_manager.update_final_review(
             _active_trade["ticket"], final_result,
             f"SL/TP hit {hit}. Total PnL:${total_pnl:+.2f} "
@@ -1718,6 +2121,20 @@ def _force_close_trade(close_time, close_price, reason, spread=0.0):
     print(f"  [ForceClose] {close_time} #{_active_trade['ticket']} {reason} | "
           f"Partial:${partial_pnl:+.2f} + Rem:${pnl_rem:+.2f} = Total:${total_pnl:+.2f}")
 
+    # Detailed Trade Force Close Log
+    log_msg = (
+        f"=== TRADE CLOSED: #{_active_trade['ticket']} (FORCE CLOSE: {reason}) ===\n"
+        f"  Time: {close_time}\n"
+        f"  Exit Price: {close_price:.2f}\n"
+        f"  Partial Banked PnL: ${partial_pnl:+.2f}\n"
+        f"  Remainder Closed PnL: ${pnl_rem:+.2f}\n"
+        f"  Total PnL: ${total_pnl:+.2f}\n"
+        f"  Final Win/Loss Outcome: {result}\n"
+        f"  Commission/Swap Drag: -${spread * lot * 100:.2f}\n"
+        f"  Current Running Account Balance: {_stats['total_pnl'] + float(os.getenv('BACKTEST_INITIAL_BALANCE', '10000')):.2f}"
+    )
+    _log_to_trade_file(_active_trade["ticket"], close_time, log_msg)
+
     memory_manager.update_final_review(
         _active_trade["ticket"], "CLOSED_BY_AI",
         f"Force close: {reason}. Total PnL: ${total_pnl:+.2f}"
@@ -1782,6 +2199,8 @@ def _save_progress_if_needed(tracker, candle_idx, current_time):
 # FINAL REPORT
 # ================================================================
 def _print_final_report():
+    global _in_final_report
+    _in_final_report = True
     total  = _stats["total_trades"]
     wins   = _stats["wins"]
     losses = _stats["losses"]

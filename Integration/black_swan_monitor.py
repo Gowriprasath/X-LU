@@ -75,6 +75,7 @@ def is_market_in_panic() -> tuple:
         try:
             tick        = mt5.symbol_info_tick(SYMBOL)
             symbol_info = mt5.symbol_info(SYMBOL)
+            d1_rates    = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_D1, 0, 3)
         finally:
             mt5.shutdown()
 
@@ -101,12 +102,7 @@ def is_market_in_panic() -> tuple:
         if mid_price > 0:
             # Use the last completed daily candle to estimate previous close
             try:
-                if mt5.initialize():
-                    try:
-                        d1_rates = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_D1, 0, 3)
-                    finally:
-                        mt5.shutdown()
-                    if d1_rates is not None and len(d1_rates) >= 2:
+                if d1_rates is not None and len(d1_rates) >= 2:
                         prev_close = float(d1_rates[-2]['close'])
                         gap_pct    = abs(mid_price - prev_close) / prev_close
                         if gap_pct > BLACK_SWAN_GAP_HALT_PCT:

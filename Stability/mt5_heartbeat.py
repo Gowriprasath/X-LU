@@ -47,6 +47,8 @@ def _attempt_reconnect() -> bool:
         try:
             success = mt5.initialize()
             if success:
+                # Re-select the symbol to guarantee MarketWatch indices remain active
+                mt5.symbol_select(_SYMBOL, True)
                 print("[MT5 Heartbeat] Reconnect successful.")
                 return True
             error = mt5.last_error()

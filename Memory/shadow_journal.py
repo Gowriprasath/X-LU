@@ -112,13 +112,23 @@ def _read() -> list:
 def _write(entries: list):
     """Write entries to disk and keep the in-memory cache in sync."""
     global _cache
-    _cache = entries             # sync cache before disk write (callers already hold _lock)
+    _cache = entries
+    import shutil
+    tmp_path = JOURNAL_FILE + ".tmp"
     try:
         os.makedirs(os.path.dirname(JOURNAL_FILE), exist_ok=True)
-        with open(JOURNAL_FILE, 'w', encoding='utf-8') as f:
+        with open(tmp_path, 'w', encoding='utf-8') as f:
             json.dump(entries, f, indent=2)
-    except Exception as e:
-        print(f"[ShadowJournal] Write error: {e}")
+            f.flush()
+            import os as _os
+            _os.fsync(f.fileno())
+        _os.replace(tmp_path, JOURNAL_FILE)
+        if _os.path.exists(JOURNAL_FILE):
+            shutil.copy2(JOURNAL_FILE, JOURNAL_FILE + ".backup")
+    except Exception as _e:
+        print(f"[ShadowJournal] Write failed: {_e}")
+        if _os.path.exists(tmp_path):
+            _os.remove(tmp_path)
 
 
 # ================================================================
@@ -291,11 +301,16 @@ def tick(current_price: float, candle: dict = None):
             bars       = e.get("bars_tracked", 0)
             max_fav    = e.get("max_favorable", 0.0)
 
-            # Compute current excursion in R-multiples
+            # Compute current excursion in R-multiples using candle high/low if available
+            if candle and "high" in candle and "low" in candle:
+                fav_price = float(candle["high"]) if signal == "BUY" else float(candle["low"])
+            else:
+                fav_price = current_price
+
             if signal == "BUY":
-                excursion_r = (current_price - entry_p) / sl_dist if sl_dist > 0 else 0
+                excursion_r = (fav_price - entry_p) / sl_dist if sl_dist > 0 else 0
             else:  # SELL
-                excursion_r = (entry_p - current_price) / sl_dist if sl_dist > 0 else 0
+                excursion_r = (entry_p - fav_price) / sl_dist if sl_dist > 0 else 0
 
             # Update max favorable excursion
             if excursion_r > max_fav:

@@ -48,21 +48,28 @@ load_dotenv()
 # -- Provider Configuration --
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 USE_GEMINI = os.getenv("USE_GEMINI", "False").strip().lower() == "true"
+USE_DEEPSEEK = os.getenv("USE_DEEPSEEK", "False").strip().lower() == "true"
+USE_NIM = os.getenv("USE_NIM", "False").strip().lower() == "true"
 
-if USE_GEMINI:
+if USE_DEEPSEEK:
+    AI_PROVIDER = "DEEPSEEK"
+    AI_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+    AI_DISPLAY_NAME = "DeepSeek Direct"
+elif USE_NIM:
+    AI_PROVIDER = "NIM"
+    AI_MODEL = os.getenv("NIM_MODEL", "meta/llama-3.3-70b-instruct")
+    AI_DISPLAY_NAME = "NVIDIA NIM"
+elif USE_GEMINI:
     AI_PROVIDER = "GEMINI"
-    AI_MODEL = "gemini-3.5-flash"
+    AI_MODEL = "gemini-2.5-flash"
     AI_DISPLAY_NAME = "Gemini"
 else:
     AI_PROVIDER = "CLAUDE"
-    AI_MODEL = "claude-sonnet-4-6"
+    try:
+        from master_controls import CLAUDE_MODEL as AI_MODEL
+    except ImportError:
+        AI_MODEL = "claude-sonnet-4-6"
     AI_DISPLAY_NAME = "Claude"
-
-__all__ = ["call_ai", "AI_MODEL", "AI_DISPLAY_NAME", "AI_PROVIDER"]
-
-# ================================================================
-# 3-KEY ROTATION STATE
-# ================================================================
 
 _key_lock = threading.Lock()
 _current_key_idx = 0          # which key slot we're currently on
@@ -251,9 +258,6 @@ def _generate_mock_decision(prompt: str) -> str:
 
     # Generate a deterministic hash for decision making
     h = int(hashlib.md5(time_str.encode('utf-8')).hexdigest(), 16)
-    
-    # We want ~4.5% frequency of trades overall to be realistic and give plenty of samples
-    is_trade_candle = (h % 22 == 0)
 
     decision = {
         "signal": "WAIT",
@@ -261,57 +265,249 @@ def _generate_mock_decision(prompt: str) -> str:
         "rationale": "Default mock wait state."
     }
 
-    if is_trade_candle:
-        if regime == "BULL_TREND":
-            decision = {
-                "signal": "BUY",
-                "confluence_score": 3,
-                "entry": current_price,
-                "sl": current_price - 8.0,
-                "tp": current_price + 16.0,
-                "rationale": f"Deterministic mock buy in BULL_TREND regime during {session} session."
-            }
-        elif regime == "BEAR_TREND":
-            decision = {
-                "signal": "SELL",
-                "confluence_score": 3,
-                "entry": current_price,
-                "sl": current_price + 8.0,
-                "tp": current_price - 16.0,
-                "rationale": f"Deterministic mock sell in BEAR_TREND regime during {session} session."
-            }
-        elif regime == "REVERSAL":
-            # REVERSAL can signal BUY or SELL depending on the hash parity
-            if h % 2 == 0:
-                decision = {
-                    "signal": "BUY",
-                    "confluence_score": 3,
-                    "entry": current_price,
-                    "sl": current_price - 6.0,
-                    "tp": current_price + 12.0,
-                    "rationale": f"Deterministic mock reversal buy in {session} session."
-                }
-            else:
-                decision = {
-                    "signal": "SELL",
-                    "confluence_score": 3,
-                    "entry": current_price,
-                    "sl": current_price + 6.0,
-                    "tp": current_price - 12.0,
-                    "rationale": f"Deterministic mock reversal sell in {session} session."
-                }
+    # We want a variety of outcomes based on h % 30
+    outcome_key = h % 30
+
+    # Let's map outcomes:
+    # 0, 1, 2, 3 -> Valid Buy
+    # 4 -> Invalid Buy (R:R low)
+    # 5 -> Invalid Buy (wrong levels)
+    # 6 -> Invalid Buy (hallucinated entry price)
+    # 7, 8, 9, 10 -> Valid Sell
+    # 11 -> Invalid Sell (R:R low)
+    # 12 -> Invalid Sell (wrong levels)
+    # 13 -> Invalid Sell (hallucinated entry price)
+    # 14, 15 -> HOLD
+    # 16, 17 -> CLOSE
+    # 18 -> Compression Buy (tight target)
+    # 19 -> Compression Sell (tight target)
+    # 20 -> BUY_LIMIT (Pending, valid)
+    # 21 -> BUY_LIMIT (Pending, invalid R:R)
+    # 22 -> SELL_LIMIT (Pending, valid)
+    # 23 -> SELL_LIMIT (Pending, invalid levels layout)
+    # 24 -> BUY_STOP (Pending, valid)
+    # 25 -> BUY_STOP (Pending, hallucinated entry)
+    # 26 -> SELL_STOP (Pending, valid)
+    # 27 -> SELL_STOP (Pending, invalid R:R)
+    # 28, 29 -> WAIT
+
+    if outcome_key in [0, 1, 2, 3]:
+        # Valid BUY setup
+        decision = {
+            "signal": "BUY",
+            "confluence_score": 3 if (h % 2 == 0) else 2,
+            "entry": current_price,
+            "sl": round(current_price - 8.0, 2),
+            "tp": round(current_price + 18.0, 2),
+            "rationale": f"Deterministic mock valid BUY setup in {regime} regime | {session} session."
+        }
+    elif outcome_key == 4:
+        # Invalid BUY (R:R below 1.5)
+        decision = {
+            "signal": "BUY",
+            "confluence_score": 3,
+            "entry": current_price,
+            "sl": round(current_price - 10.0, 2),
+            "tp": round(current_price + 8.0, 2), # R:R = 0.8 < 1.5
+            "rationale": f"Deterministic mock invalid R:R BUY setup (hallucination guard test)."
+        }
+    elif outcome_key == 5:
+        # Invalid BUY (wrong levels: sl > entry)
+        decision = {
+            "signal": "BUY",
+            "confluence_score": 3,
+            "entry": current_price,
+            "sl": round(current_price + 5.0, 2), # sl is above entry
+            "tp": round(current_price + 15.0, 2),
+            "rationale": f"Deterministic mock invalid level layout BUY setup."
+        }
+    elif outcome_key == 6:
+        # Invalid BUY (entry far from current_price: hallucination)
+        decision = {
+            "signal": "BUY",
+            "confluence_score": 3,
+            "entry": round(current_price + 35.0, 2), # entry is >20 pts away
+            "sl": round(current_price + 27.0, 2),
+            "tp": round(current_price + 55.0, 2),
+            "rationale": f"Deterministic mock hallucinated entry price BUY setup."
+        }
+    elif outcome_key in [7, 8, 9, 10]:
+        # Valid SELL setup
+        decision = {
+            "signal": "SELL",
+            "confluence_score": 3 if (h % 2 == 0) else 2,
+            "entry": current_price,
+            "sl": round(current_price + 8.0, 2),
+            "tp": round(current_price - 18.0, 2),
+            "rationale": f"Deterministic mock valid SELL setup in {regime} regime | {session} session."
+        }
+    elif outcome_key == 11:
+        # Invalid SELL (R:R below 1.5)
+        decision = {
+            "signal": "SELL",
+            "confluence_score": 3,
+            "entry": current_price,
+            "sl": round(current_price + 10.0, 2),
+            "tp": round(current_price - 8.0, 2), # R:R = 0.8 < 1.5
+            "rationale": f"Deterministic mock invalid R:R SELL setup (hallucination guard test)."
+        }
+    elif outcome_key == 12:
+        # Invalid SELL (wrong levels: sl < entry)
+        decision = {
+            "signal": "SELL",
+            "confluence_score": 3,
+            "entry": current_price,
+            "sl": round(current_price - 5.0, 2), # sl is below entry
+            "tp": round(current_price - 15.0, 2),
+            "rationale": f"Deterministic mock invalid level layout SELL setup."
+        }
+    elif outcome_key == 13:
+        # Invalid SELL (entry far from current_price)
+        decision = {
+            "signal": "SELL",
+            "confluence_score": 3,
+            "entry": round(current_price - 35.0, 2), # entry is >20 pts away
+            "sl": round(current_price - 27.0, 2),
+            "tp": round(current_price - 55.0, 2),
+            "rationale": f"Deterministic mock hallucinated entry price SELL setup."
+        }
+    elif outcome_key in [14, 15]:
+        decision = {
+            "signal": "HOLD",
+            "confluence_score": 1,
+            "rationale": f"Deterministic mock HOLD signal generated in {regime}."
+        }
+    elif outcome_key in [16, 17]:
+        decision = {
+            "signal": "CLOSE",
+            "confluence_score": 2,
+            "rationale": f"Deterministic mock CLOSE signal generated in {regime}."
+        }
+    elif outcome_key == 18:
+        # Compression BUY setup (designed to hit partials and tight break-evens easily)
+        decision = {
+            "signal": "BUY",
+            "confluence_score": 3,
+            "entry": current_price,
+            "sl": round(current_price - 6.0, 2),
+            "tp": round(current_price + 12.0, 2),
+            "rationale": f"Deterministic mock compression BUY setup in {regime} regime."
+        }
+    elif outcome_key == 19:
+        # Compression SELL setup (designed to hit partials and tight break-evens easily)
+        decision = {
+            "signal": "SELL",
+            "confluence_score": 3,
+            "entry": current_price,
+            "sl": round(current_price + 6.0, 2),
+            "tp": round(current_price - 12.0, 2),
+            "rationale": f"Deterministic mock compression SELL setup in {regime} regime."
+        }
+    elif outcome_key == 20:
+        # Valid BUY_LIMIT order (entry below market price)
+        entry_price = round(current_price - 4.0, 2)
+        decision = {
+            "signal": "BUY_LIMIT",
+            "confluence_score": 3,
+            "entry": entry_price,
+            "sl": round(entry_price - 8.0, 2),
+            "tp": round(entry_price + 18.0, 2),
+            "rationale": f"Deterministic mock valid BUY_LIMIT setup in {regime} regime | {session} session."
+        }
+    elif outcome_key == 21:
+        # Invalid BUY_LIMIT order (R:R below 1.5)
+        entry_price = round(current_price - 4.0, 2)
+        decision = {
+            "signal": "BUY_LIMIT",
+            "confluence_score": 3,
+            "entry": entry_price,
+            "sl": round(entry_price - 10.0, 2),
+            "tp": round(entry_price + 5.0, 2), # R:R low
+            "rationale": f"Deterministic mock invalid R:R BUY_LIMIT setup (safety test)."
+        }
+    elif outcome_key == 22:
+        # Valid SELL_LIMIT order (entry above market price)
+        entry_price = round(current_price + 4.0, 2)
+        decision = {
+            "signal": "SELL_LIMIT",
+            "confluence_score": 3,
+            "entry": entry_price,
+            "sl": round(entry_price + 8.0, 2),
+            "tp": round(entry_price - 18.0, 2),
+            "rationale": f"Deterministic mock valid SELL_LIMIT setup in {regime} regime | {session} session."
+        }
+    elif outcome_key == 23:
+        # Invalid SELL_LIMIT order (wrong levels: sl is below entry)
+        entry_price = round(current_price + 4.0, 2)
+        decision = {
+            "signal": "SELL_LIMIT",
+            "confluence_score": 3,
+            "entry": entry_price,
+            "sl": round(entry_price - 5.0, 2),
+            "tp": round(entry_price - 15.0, 2),
+            "rationale": f"Deterministic mock invalid levels SELL_LIMIT setup."
+        }
+    elif outcome_key == 24:
+        # Valid BUY_STOP order (entry above market price)
+        entry_price = round(current_price + 4.0, 2)
+        decision = {
+            "signal": "BUY_STOP",
+            "confluence_score": 3,
+            "entry": entry_price,
+            "sl": round(entry_price - 8.0, 2),
+            "tp": round(entry_price + 18.0, 2),
+            "rationale": f"Deterministic mock valid BUY_STOP setup in {regime} regime | {session} session."
+        }
+    elif outcome_key == 25:
+        # Invalid BUY_STOP order (hallucinated entry price too far)
+        decision = {
+            "signal": "BUY_STOP",
+            "confluence_score": 3,
+            "entry": round(current_price + 35.0, 2),
+            "sl": round(current_price + 27.0, 2),
+            "tp": round(current_price + 55.0, 2),
+            "rationale": f"Deterministic mock hallucinated entry price BUY_STOP setup."
+        }
+    elif outcome_key == 26:
+        # Valid SELL_STOP order (entry below market price)
+        entry_price = round(current_price - 4.0, 2)
+        decision = {
+            "signal": "SELL_STOP",
+            "confluence_score": 3,
+            "entry": entry_price,
+            "sl": round(entry_price + 8.0, 2),
+            "tp": round(entry_price - 18.0, 2),
+            "rationale": f"Deterministic mock valid SELL_STOP setup in {regime} regime | {session} session."
+        }
+    elif outcome_key == 27:
+        # Invalid SELL_STOP order (R:R below 1.5)
+        entry_price = round(current_price - 4.0, 2)
+        decision = {
+            "signal": "SELL_STOP",
+            "confluence_score": 3,
+            "entry": entry_price,
+            "sl": round(entry_price + 10.0, 2),
+            "tp": round(entry_price - 8.0, 2),
+            "rationale": f"Deterministic mock invalid R:R SELL_STOP setup."
+        }
+    else:
+        decision = {
+            "signal": "WAIT",
+            "confluence_score": 1,
+            "rationale": f"Deterministic mock WAIT setup in {regime} regime during {session} session."
+        }
 
     # Wrap the decision dictionary as a JSON block
     return json.dumps(decision, indent=2)
 
 
 def call_ai(prompt: str, max_tokens: int = 2048) -> str | None:
-    if is_backtest_mode():
-        return _generate_mock_decision(prompt)
-
     """
     Makes a single-turn Claude or Gemini call. Auto-rotates across API keys
     on rate-limit or overloaded errors. Returns plain string or None.
+
+
+    Args:
 
 
     Args:
@@ -321,12 +517,56 @@ def call_ai(prompt: str, max_tokens: int = 2048) -> str | None:
     Returns:
         Response text string, or None on total failure.
     """
+    if is_backtest_mode():
+        if os.getenv("BACKTEST_AI_MODE") == "real":
+            provider = os.getenv("BACKTEST_AI_PROVIDER", "mock").strip().lower()
+            if provider == "nim":
+                from Integration.NIM import call_nim
+                return call_nim(prompt, max_tokens)
+            elif provider == "deepseek":
+                from Integration.DeepSeek import call_deepseek
+                res = call_deepseek(prompt, max_tokens)
+                if res is None:
+                    # Self-healing fallback to NVIDIA NIM
+                    print("[ai_client] 🔄 Backtest DeepSeek failed/exhausted. Falling back to NVIDIA NIM...")
+                    from Integration.NIM import call_nim
+                    return call_nim(prompt, max_tokens)
+                return res
+            elif provider in ("claude", "gemini"):
+                # Bypass mock generator and proceed to real API execution logic below
+                pass
+            else:
+                return _generate_mock_decision(prompt)
+        else:
+            return _generate_mock_decision(prompt)
+
     global _current_key_idx, _cb_consecutive_fails, _cb_tripped, _cb_tripped_at
 
     # -- Circuit breaker guard --
     if not is_ai_available():
         print_outage_banner()
         return None
+
+    if USE_DEEPSEEK:
+        from Integration.DeepSeek import call_deepseek
+        res = call_deepseek(prompt, max_tokens)
+        if res is not None:
+            return res
+        print("[ai_client] 🔄 Live DeepSeek failed/exhausted. Trying fallback to NVIDIA NIM...")
+        from Integration.NIM import call_nim
+        res = call_nim(prompt, max_tokens)
+        if res is not None:
+            return res
+        print("[ai_client] 🔄 Live NIM fallback failed. Trying fallback to Claude keys...")
+        # fall through to Claude
+
+    elif USE_NIM:
+        from Integration.NIM import call_nim
+        res = call_nim(prompt, max_tokens)
+        if res is not None:
+            return res
+        print("[ai_client] 🔄 Live NIM failed. Trying fallback to Claude keys...")
+        # fall through to Claude
 
     if USE_GEMINI:
         try:
@@ -423,6 +663,7 @@ def call_ai(prompt: str, max_tokens: int = 2048) -> str | None:
                 _key_fail_count[i] = 0
         start_idx = _current_key_idx % n
 
+    _last_err = None
     for attempt in range(n):       # try each key at most once per call
         with _key_lock:
             key_idx = (start_idx + attempt) % n
@@ -480,6 +721,7 @@ def call_ai(prompt: str, max_tokens: int = 2048) -> str | None:
             return "\n".join(texts).strip()
 
         except Exception as exc:
+            _last_err = exc
             if _is_rate_limit_error(exc):
                 with _key_lock:
                     _key_fail_count[key_idx] = _key_fail_count.get(key_idx, 0) + 1
@@ -524,7 +766,30 @@ def call_ai(prompt: str, max_tokens: int = 2048) -> str | None:
                 f"AI CIRCUIT BREAKER TRIPPED — "
                 f"paused {_CB_COOLDOWN_SECONDS/60:.0f} min"
             )
-            _last_err_str = str(exc) if 'exc' in dir() else "unknown"
+            _last_err_str = str(_last_err) if _last_err else "unknown"
+            send_outage_alert(
+                f"Circuit breaker tripped after "
+                f"{_cb_consecutive_fails} consecutive failures. "
+                f"Last error: {_last_err_str[:120]}"
+            )
+            print(
+                f"[ai_client] Last API error: {_last_err_str[:200]}"
+            )
+    return None
+
+
+# ================================================================
+# CLIENT FACTORY (for files that need raw client - not recommended)
+# ================================================================
+
+def get_client():
+    """
+    Returns an Anthropic client using the current best key.
+    Prefer call_ai() for all normal use - this is for edge cases only.
+    """
+    try:
+        import anthropic
+    except ImportError:
             send_outage_alert(
                 f"Circuit breaker tripped after "
                 f"{_cb_consecutive_fails} consecutive failures. "
@@ -555,7 +820,6 @@ def get_client():
         idx = _current_key_idx % len(keys)
     return anthropic.Anthropic(api_key=keys[idx])
 
-
 # ================================================================
 # STARTUP VALIDATION
 # ================================================================
@@ -564,11 +828,17 @@ def _validate_on_import():
     """Checks keys exist at import time - fails fast before bot starts."""
     try:
         keys = _load_keys()
-        print(f"[ai_client] ✓ {AI_DISPLAY_NAME} ({AI_MODEL}) | "
-              f"{len(keys)} API key(s) loaded.")
+        try:
+            print(f"[ai_client] ✓ {AI_DISPLAY_NAME} ({AI_MODEL}) | "
+                  f"{len(keys)} API key(s) loaded.")
+        except UnicodeEncodeError:
+            print(f"[ai_client] [OK] {AI_DISPLAY_NAME} ({AI_MODEL}) | "
+                  f"{len(keys)} API key(s) loaded.")
     except EnvironmentError as e:
-        print(f"[ai_client] ✗ {e}")
-
+        try:
+            print(f"[ai_client] ✗ {e}")
+        except UnicodeEncodeError:
+            print(f"[ai_client] [FAIL] {e}")
 
 _validate_on_import()
 

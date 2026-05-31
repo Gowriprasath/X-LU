@@ -411,8 +411,20 @@ def run_post_mortem(simulated_time=None, m5_df=None, h1_df=None):
         else:
             _sim_ny = simulated_time.astimezone(_NY)
         today = _sim_ny.strftime("%Y-%m-%d")
-    else:
         today = get_ny_time().strftime("%Y-%m-%d")
+
+    pm_success = True
+
+    # -- Gate Review: process shadow journal blocks ------------------
+    try:
+        from Integration.Wisdom_Worker.gate_review_builder \
+            import process_new_blocks, should_trigger_monthly_review
+        new_blocks = process_new_blocks()
+        if new_blocks > 0:
+            print(f"[PostMortem] Gate review: {new_blocks} new "
+                  f"confidence gate outcomes logged.")
+    except Exception as _gre:
+        print(f"[PostMortem] Gate review processing skipped: {_gre}")
 
     # ----------------------------------------------------------------
     # Load trade memory (needed for STEP 1-4)
@@ -567,16 +579,14 @@ Respond with plain text only, no JSON, no bullet points.
             print(f"[PostMortem] Keyword tagger import error: {tag_err}")
 
         if tagged_count >= len(recent_trades) - 1:
-            mark_as_run_today()
             print(f"[PostMortem] ✅ Hindsight+tags complete. "
                   f"{tagged_count}/{len(recent_trades)} trades processed.")
         else:
             print(f"[PostMortem] ⚠️ Only {tagged_count}/{len(recent_trades)} trades tagged. "
                   f"NOT marking complete — will retry.")
+            pm_success = False
     else:
         print("[PostMortem] No new closed trades to process for STEPS 1–4.")
-        # Still mark as run so we don't spin-loop — Steps 5 & 6 will still execute.
-        mark_as_run_today()
 
     # ================================================================
     # FIX C7: STEPS 3b, 5 + 6 NOW RUN UNCONDITIONALLY EVERY DAY
@@ -658,6 +668,19 @@ Respond with plain text only, no JSON, no bullet points.
 
     except Exception as scout_err:
         print(f"[PostMortem] Strategy Scout error (non-fatal): {scout_err}")
+
+    # -- Gate Review: monthly meta-review if triggered ----------------
+    try:
+        if should_trigger_monthly_review():
+            print("[PostMortem] Monthly gate review triggered...")
+            from tools.trigger_monthly_gate_review import run_monthly_review
+            run_monthly_review()
+    except Exception as _gmr:
+        print(f"[PostMortem] Monthly gate review skipped: {_gmr}")
+
+    if pm_success:
+        mark_as_run_today()
+        print("[PostMortem] ✅ Daily post-mortem process fully complete and marked as run today.")
 
 
 def check_and_run_if_needed(force=False, simulated_time=None, m5_df=None, h1_df=None):
