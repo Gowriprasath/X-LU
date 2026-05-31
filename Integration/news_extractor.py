@@ -86,7 +86,8 @@ def _fetch_from_api():
             continue
         try:
             dt_ny = dateutil.parser.isoparse(event.get('date', '')).astimezone(NY_TZ)
-        except Exception:
+        except Exception as e:
+            print(f"[NewsExtractor] Date parsing error for event {event.get('title', 'Unknown')}: {e}")
             continue
         if dt_ny.date() != today_ny:
             continue
