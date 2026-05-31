@@ -846,6 +846,12 @@ def train(date_from=None, date_to=None, rebuild_features=True,
 
     X = features[base_avail].copy()
 
+    # ── REVERSAL-FIX: snapshot raw features BEFORE z-score ───────
+    # The reversal detector needs raw ATR/ADX/vol values.
+    # Z-scoring collapses spike signal → XGBoost early-stops at tree 4
+    # with recall=0.000. Snapshot here, align to valid index below.
+    X_raw_for_reversal = X.copy()
+
     # ── Rolling z-score normalisation ────────────────────────────
     # Applied to TF price features only. Time + persistence left raw.
     # First ~250 rows become NaN (warmup window) — dropped in valid mask below.
@@ -885,6 +891,9 @@ def train(date_from=None, date_to=None, rebuild_features=True,
     X, y  = X[avail][valid], y[valid]
     print(f"[Trainer] After z-score + dropna: {len(X):,} rows "
           f"(dropped {(~valid).sum():,} warmup rows)")
+
+    # Align raw snapshot to same valid rows (warmup NaNs dropped above)
+    X_raw_for_reversal = X_raw_for_reversal.reindex(X.index)
 
     le = LabelEncoder()
     le.fit(ALL_REGIMES)
@@ -1010,13 +1019,11 @@ def train(date_from=None, date_to=None, rebuild_features=True,
     print("\n[Trainer] Training REVERSAL binary pre-filter (Stage 1)...")
     try:
         from reversal_detector import train as train_reversal
-        # Pass X_prefisf (pre-FISF full feature matrix) — NOT X_final.
-        # FISF drops h1_bb_width, h1_atr_ratio etc. which the reversal
-        # detector hard-requires. X_prefisf has all columns intact.
-        # FIX: apply same valid mask used for y — prevents index/NaN mismatch
-        # that caused XGBoost to early-stop at tree 4 with zero recall.
-        X_prefisf_valid = X_prefisf[valid]
-        rev_results = train_reversal(X_prefisf_valid, y, verbose=True)
+        # REVERSAL-FIX: pass raw (unscaled) features — not z-scored X_prefisf.
+        # X_raw_for_reversal was snapshotted before apply_rolling_zscore()
+        # and aligned to valid rows above. Raw ATR/ADX values give XGBoost
+        # real spike signal to learn from.
+        rev_results = train_reversal(X_raw_for_reversal, y, verbose=True)
         if rev_results:
             print(f"✅ REVERSAL pre-filter: "
                   f"recall={rev_results.get('recall',0):.3f} "
